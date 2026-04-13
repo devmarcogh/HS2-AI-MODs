@@ -136,7 +136,8 @@ namespace StudioModsMSG
             DrawFloatRow(host, "Bending",   ref p.BendStiffness,    0f,     2f);
             DrawFloatRow(host, "Damping",   ref p.Damping,          0f,     40f);
             DrawFloatRow(host, "Thickness", ref p.Thickness,        0.002f, 0.05f);
-            DrawFloatRow(host, "Gravity",   ref p.Gravity,          -30f,   0f);
+            DrawFloatRow(host, "Gravity",      ref p.Gravity,          -30f,   0f);
+            DrawFloatRow(host, "Compression", ref p.Compression,       0f,     1f);
 
             GUILayout.Space(4f);
             DrawIntRow(host, "Substeps",   ref p.Substeps,   1, 4);

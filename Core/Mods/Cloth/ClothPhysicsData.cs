@@ -17,6 +17,9 @@ namespace StudioModsMSG
         public int   Substeps         = 3;      // physics substeps per LateUpdate (more = stable)
         public int   Iterations       = 12;     // xPBD constraint iterations per substep (12 = tight constraints, reduce tearing)
         public bool  ClothToCloth     = true;   // enable inter-cloth collision
+        // 0 = off; 1 = fully locked to rest pose. Pulls each free vertex back toward
+        // its rest position in character-root space, preventing cloth from ballooning.
+        public float Compression      = 0.05f;
     }
 
     // -----------------------------------------------------------------------
@@ -77,6 +80,7 @@ namespace StudioModsMSG
         public MeshCollider ClothCollider;      // runtime collider rebuilt from WorkMesh
         public Material[]   OriginalMaterials;  // saved from SMR on disable
         public Vector3[]    LocalVerts;         // cached buffer for WriteMesh (no GC per frame)
+        public Vector3[]    RestBodyLocalPos;   // rest world-pos stored in chaCtrl local space (for Compression)
 
         // -- Broadphase --
         public Bounds WorldBounds;

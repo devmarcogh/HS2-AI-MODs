@@ -231,6 +231,19 @@ namespace StudioModsMSG
                 }
             }
 
+            // Shape retention / compression — pulls free verts toward rest body pose.
+            // alpha is framerate-normalised so behaviour is stable across substep counts.
+            if (s.Params.Compression > 0f && s.RestBodyLocalPos != null && chaCtrl != null)
+            {
+                float alpha = Mathf.Clamp01(s.Params.Compression * dt * 60f);
+                for (int i = 0; i < n; i++)
+                {
+                    if (s.IsPinned[i]) continue;
+                    Vector3 restWorld = chaCtrl.transform.TransformPoint(s.RestBodyLocalPos[i]);
+                    s.PredPosition[i] = Vector3.Lerp(s.PredPosition[i], restWorld, alpha);
+                }
+            }
+
             // 4. Commit
             float inv_dt = 1f / dt;
             float damp = Mathf.Clamp01(1f - s.Params.Damping * dt);
@@ -511,6 +524,14 @@ namespace StudioModsMSG
                     remappedBindVerts[i] = bindVerts[srcIdx];
             }
             IdentifyPins(state, smr, remappedBw, remappedBindVerts, worldRest);
+
+            // Store rest positions in character-root local space for the Compression constraint.
+            if (chaCtrl != null)
+            {
+                state.RestBodyLocalPos = new Vector3[state.VertCount];
+                for (int i = 0; i < state.VertCount; i++)
+                    state.RestBodyLocalPos[i] = chaCtrl.transform.InverseTransformPoint(worldRest[i]);
+            }
 
             BuildEdges(state, tris, worldRest);
             float totalMass = 1.0f;
