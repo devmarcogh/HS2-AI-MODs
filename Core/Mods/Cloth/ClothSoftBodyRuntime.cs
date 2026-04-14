@@ -141,7 +141,8 @@ namespace StudioModsMSG
             foreach (ClothMeshState state in activeStates)
             {
                 if (state == null || state.Renderer == null) continue;
-                int   substeps = Mathf.Max(1, state.Params.Substeps);
+                // Substeps is a quality multiplier (0.25..1). Map to concrete count.
+                int   substeps = Mathf.Max(1, Mathf.RoundToInt(4f * state.Params.Substeps));
                 float subDt    = dt / substeps;
                 Vector3 subCharDelta = chaMoveDelta / substeps;
                 for (int sub = 0; sub < substeps; sub++)
@@ -190,7 +191,9 @@ namespace StudioModsMSG
             float tildedCompliance = 1f / Mathf.Max(1e-6f, s.Params.StretchStiffness * dt * dt);
             float thick = s.Params.Thickness;
 
-            for (int iter = 0; iter < s.Params.Iterations; iter++)
+            // Iterations is a quality multiplier (0.25..1). Map to concrete count.
+            int iterations = Mathf.Max(1, Mathf.RoundToInt(12f * s.Params.Iterations));
+            for (int iter = 0; iter < iterations; iter++)
             {
                 SolveEdges_XPBD(s, tildedCompliance);
                 ApplyHardPins(s, s.PredPosition); // Vital para que no se caiga la ropa
@@ -231,19 +234,6 @@ namespace StudioModsMSG
                 }
             }
 
-            // Shape retention / compression — pulls free verts toward rest body pose.
-            // alpha is framerate-normalised so behaviour is stable across substep counts.
-            if (s.Params.Compression > 0f && s.RestBodyLocalPos != null && chaCtrl != null)
-            {
-                float alpha = Mathf.Clamp01(s.Params.Compression * dt * 60f);
-                for (int i = 0; i < n; i++)
-                {
-                    if (s.IsPinned[i]) continue;
-                    Vector3 restWorld = chaCtrl.transform.TransformPoint(s.RestBodyLocalPos[i]);
-                    s.PredPosition[i] = Vector3.Lerp(s.PredPosition[i], restWorld, alpha);
-                }
-            }
-
             // 4. Commit
             float inv_dt = 1f / dt;
             float damp = Mathf.Clamp01(1f - s.Params.Damping * dt);
@@ -254,8 +244,16 @@ namespace StudioModsMSG
                 s.Position[i] = s.PredPosition[i];
             }
         }
+        // MaxCompressionRatio: at Compression=1 edges target 65% of rest length.
+        // Keeping it below 50% avoids degeneracy while giving meaningful press-against-body effect.
+        private const float MaxCompressionRatio = 0.35f;
+
         private static void SolveEdges_XPBD(ClothMeshState s, float tildedCompliance)
         {
+            // Compression scales down the target rest length so the fabric tries to shrink
+            // and press against any colliding surface (the body). Does NOT freeze motion.
+            float pressScale = 1f - s.Params.Compression * MaxCompressionRatio;
+
             for (int e = 0; e < s.Edges.Length; e += 2)
             {
                 int i = s.Edges[e], j = s.Edges[e + 1];
@@ -268,7 +266,7 @@ namespace StudioModsMSG
                 float   len = d.magnitude;
                 if (len < 1e-7f) continue;
 
-                float   C      = len - s.RestEdgeLen[e / 2];
+                float   C      = len - s.RestEdgeLen[e / 2] * pressScale;
                 float   lambda = -C / wSum;
                 Vector3 corr   = (d / len) * lambda;
 
@@ -328,52 +326,136 @@ namespace StudioModsMSG
                 s.ClothCollider.sharedMesh = s.WorkMesh;
             }
         }
-        private static Vector3 ComputePinCentroid(ClothMeshState s)
+        private void ApplyHardPins(ClothMeshState s, Vector3[] dst)
         {
-            if (s.PinData != null && s.PinData.Length > 0)
+            if (s.PinFollowBones == null || s.PinFollowLocalPos == null) return;
+            for (int i = 0; i < s.VertCount; i++)
             {
-                Vector3 sum = Vector3.zero;
-                foreach (var pd in s.PinData) sum += s.Position[pd.VertexIndex];
-                return sum / s.PinData.Length;
+                if (!s.IsPinned[i]) continue;
+                Transform follow = s.PinFollowBones[i];
+                if (follow == null) continue;
+                dst[i] = follow.TransformPoint(s.PinFollowLocalPos[i]);
             }
-            if (s.FallbackPinLocalPos != null)
-            {
-                Vector3 sum = Vector3.zero; int cnt = 0;
-                for (int i = 0; i < s.VertCount; i++)
-                    if (s.IsPinned[i]) { sum += s.Position[i]; cnt++; }
-                return cnt > 0 ? sum / cnt : Vector3.zero;
-            }
-            return Vector3.zero;
         }
-        private static void ApplyHardPins(ClothMeshState s, Vector3[] dst)
-        {
-            // Standard bone-weight pins
-            foreach (var pd in s.PinData)
-                dst[pd.VertexIndex] = ComputePinWorldPos(s, pd);
+        private void UpdatePins(ClothMeshState s) => ApplyHardPins(s, s.Position);
 
-            // Fallback root-relative pins (set when mesh has no usable boneWeights)
-            if (s.FallbackPinLocalPos != null && s.FallbackPinRoot != null)
-                for (int i = 0; i < s.VertCount; i++)
-                    if (s.IsPinned[i])
-                        dst[i] = s.FallbackPinRoot.TransformPoint(s.FallbackPinLocalPos[i]);
-        }
-        private static void UpdatePins(ClothMeshState s) => ApplyHardPins(s, s.Position);
-
-        private static Vector3 ComputePinWorldPos(ClothMeshState s, ClothBonePinData pd)
+        // Re-evaluates pinned vertices from the currently selected source bone.
+        // Vertices dominated by this bone are pinned, and they follow the source
+        // bone parent transform to stay aligned with animation.
+        public void RecomputePinsFromSelectedBone(ClothMeshState state)
         {
-            Vector3 rp = pd.RestPos;
-            Vector4 rh = new Vector4(rp.x, rp.y, rp.z, 1f);
-            Vector4 sum = Vector4.zero;
-            for (int k = 0; k < 4; k++)
+            if (state == null || state.IsPinned == null || chaCtrl == null) return;
+            int n = state.VertCount;
+
+            for (int i = 0; i < n; i++)
+                state.IsPinned[i] = false;
+
+            if (state.PinFollowBones == null || state.PinFollowBones.Length != n)
+                state.PinFollowBones = new Transform[n];
+            if (state.PinFollowLocalPos == null || state.PinFollowLocalPos.Length != n)
+                state.PinFollowLocalPos = new Vector3[n];
+
+            for (int i = 0; i < n; i++)
+                state.PinFollowBones[i] = null;
+
+            if (state.PinSourceBoneNames != null && state.PinSourceBoneNames.Count > 0 &&
+                state.SkinBones != null && state.VertexBoneWeights != null)
             {
-                float w = pd.BoneWeights[k];
-                int   b = pd.BoneIndices[k];
-                if (w < 0.0001f || b < 0 || b >= s.PinBoneArray.Length) continue;
-                if (s.PinBoneArray[b] == null) continue;
-                Matrix4x4 m = s.PinBoneArray[b].localToWorldMatrix * s.PinBindPoses[b];
-                sum += w * (m * rh);
+                var selectedBoneIndices = new HashSet<int>();
+                for (int b = 0; b < state.SkinBones.Length; b++)
+                {
+                    Transform bone = state.SkinBones[b];
+                    if (bone == null) continue;
+                    for (int sbi = 0; sbi < state.PinSourceBoneNames.Count; sbi++)
+                    {
+                        string selectedName = state.PinSourceBoneNames[sbi];
+                        if (string.IsNullOrEmpty(selectedName)) continue;
+                        if (string.Equals(bone.name, selectedName, StringComparison.OrdinalIgnoreCase))
+                        {
+                            selectedBoneIndices.Add(b);
+                            break;
+                        }
+                    }
+                }
+
+                if (selectedBoneIndices.Count > 0 && state.RestBodyLocalPos != null)
+                {
+                    for (int i = 0; i < n; i++)
+                    {
+                        BoneWeight bw = state.VertexBoneWeights[i];
+                        int domBone = bw.boneIndex0;
+                        float domW = bw.weight0;
+
+                        if (bw.weight1 > domW) { domW = bw.weight1; domBone = bw.boneIndex1; }
+                        if (bw.weight2 > domW) { domW = bw.weight2; domBone = bw.boneIndex2; }
+                        if (bw.weight3 > domW) { domW = bw.weight3; domBone = bw.boneIndex3; }
+
+                        if (selectedBoneIndices.Contains(domBone) && domW > 0.0001f)
+                        {
+                            state.IsPinned[i] = true;
+                            Transform sourceBone = (domBone >= 0 && domBone < state.SkinBones.Length) ? state.SkinBones[domBone] : null;
+                            Transform followBone = sourceBone != null && sourceBone.parent != null ? sourceBone.parent : sourceBone;
+                            state.PinFollowBones[i] = followBone;
+
+                            Vector3 restWorld = chaCtrl.transform.TransformPoint(state.RestBodyLocalPos[i]);
+                            if (followBone != null)
+                                state.PinFollowLocalPos[i] = followBone.InverseTransformPoint(restWorld);
+                        }
+                    }
+                }
             }
-            return new Vector3(sum.x, sum.y, sum.z);
+
+            float mass = 1f / Mathf.Max(1, n);
+            for (int i = 0; i < n; i++)
+            {
+                state.Mass[i]    = mass;
+                state.InvMass[i] = state.IsPinned[i] ? 0f : 1f / mass;
+                if (state.IsPinned[i] && state.Velocity != null)
+                    state.Velocity[i] = Vector3.zero;
+            }
+
+            if (state.IsActive) UpdatePins(state);
+        }
+
+        private void OnDrawGizmos()
+        {
+            if (entries == null || entries.Count == 0) return;
+
+            foreach (ClothPhysicsEntry entry in entries)
+            {
+                if (entry == null || entry.Meshes == null) continue;
+                foreach (ClothMeshState mesh in entry.Meshes)
+                {
+                    if (mesh == null || !mesh.ShowPinBoneGizmos || mesh.SkinBones == null) continue;
+                    if (mesh.PinSourceBoneNames == null || mesh.PinSourceBoneNames.Count == 0) continue;
+
+                    for (int i = 0; i < mesh.SkinBones.Length; i++)
+                    {
+                        Transform bone = mesh.SkinBones[i];
+                        if (bone == null || !ContainsBoneName(mesh.PinSourceBoneNames, bone.name)) continue;
+
+                            Gizmos.color = new Color(0.1f, 1f, 1f, 0.9f);
+                            Gizmos.DrawSphere(bone.position, 0.025f);
+
+                        Transform parent = bone.parent;
+                        if (parent != null)
+                            Gizmos.DrawLine(parent.position, bone.position);
+
+                    }
+                }
+            }
+        }
+
+        private static bool ContainsBoneName(List<string> selectedNames, string boneName)
+        {
+            if (selectedNames == null || string.IsNullOrEmpty(boneName)) return false;
+            for (int i = 0; i < selectedNames.Count; i++)
+            {
+                string v = selectedNames[i];
+                if (!string.IsNullOrEmpty(v) && string.Equals(v, boneName, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            return false;
         }
         private static void UpdateWorldBounds(ClothMeshState s)
         {
@@ -511,21 +593,20 @@ namespace StudioModsMSG
             state.WorkMesh.uv = weldedUvs;
             state.WorkMesh.RecalculateBounds();
             state.WorkMesh.RecalculateNormals();
-            BoneWeight[] bw         = src.boneWeights;
-            Vector3[]    bindVerts  = src.vertices;  // bind-pose vertices for RestPos
-            BoneWeight[] remappedBw = new BoneWeight[state.VertCount];
-            Vector3[] remappedBindVerts = new Vector3[state.VertCount];
+
+            BoneWeight[] srcBoneWeights = src.boneWeights;
+            state.VertexBoneWeights = new BoneWeight[state.VertCount];
             for (int i = 0; i < state.VertCount; i++)
             {
                 int srcIdx = newToOriginalMap[i];
-                if (bw != null && srcIdx >= 0 && srcIdx < bw.Length)
-                    remappedBw[i] = bw[srcIdx];
-                if (bindVerts != null && srcIdx >= 0 && srcIdx < bindVerts.Length)
-                    remappedBindVerts[i] = bindVerts[srcIdx];
+                if (srcBoneWeights != null && srcIdx >= 0 && srcIdx < srcBoneWeights.Length)
+                    state.VertexBoneWeights[i] = srcBoneWeights[srcIdx];
+                else
+                    state.VertexBoneWeights[i] = default(BoneWeight);
             }
-            IdentifyPins(state, smr, remappedBw, remappedBindVerts, worldRest);
+            state.SkinBones = smr.bones;
 
-            // Store rest positions in character-root local space for the Compression constraint.
+            // Store rest positions in character-root local space (Compression + pinning).
             if (chaCtrl != null)
             {
                 state.RestBodyLocalPos = new Vector3[state.VertCount];
@@ -533,14 +614,11 @@ namespace StudioModsMSG
                     state.RestBodyLocalPos[i] = chaCtrl.transform.InverseTransformPoint(worldRest[i]);
             }
 
+            // Apply current selected-bone pinning.
+            RecomputePinsFromSelectedBone(state);
+
             BuildEdges(state, tris, worldRest);
-            float totalMass = 1.0f;
-            float mass      = totalMass / Mathf.Max(1, state.VertCount);
-            for (int i = 0; i < state.VertCount; i++)
-            {
-                state.Mass[i]    = mass;
-                state.InvMass[i] = state.IsPinned[i] ? 0f : 1f / mass;
-            }
+            // Mass and IsPinned are already set by RecomputePinsFromSelectedBone above.
 
             GameObject go = smr.gameObject;
             state.OriginalMaterials = smr.sharedMaterials;  // shared: no extra material instances
@@ -659,81 +737,6 @@ namespace StudioModsMSG
             lens.Add((pos[lo] - pos[hi]).magnitude);
         }
 
-        private void IdentifyPins(ClothMeshState s, SkinnedMeshRenderer smr, BoneWeight[] bw, Vector3[] bindVerts, Vector3[] worldRest)
-        {
-            const float PinThreshold = 0.75f;
-
-            var usedBones = new HashSet<int>();
-            if (bw != null)
-            {
-                for (int i = 0; i < s.VertCount && i < bw.Length; i++)
-                {
-                    float dom = Mathf.Max(Mathf.Max(bw[i].weight0, bw[i].weight1),
-                                         Mathf.Max(bw[i].weight2, bw[i].weight3));
-                    if (dom >= PinThreshold)
-                    {
-                        s.IsPinned[i] = true;
-                        if (bw[i].weight0 > 0.001f) usedBones.Add(bw[i].boneIndex0);
-                        if (bw[i].weight1 > 0.001f) usedBones.Add(bw[i].boneIndex1);
-                        if (bw[i].weight2 > 0.001f) usedBones.Add(bw[i].boneIndex2);
-                        if (bw[i].weight3 > 0.001f) usedBones.Add(bw[i].boneIndex3);
-                    }
-                }
-            }
-
-            int maxOrig = 0;
-            foreach (int bi in usedBones) if (bi > maxOrig) maxOrig = bi;
-            Transform[]  bones     = smr.bones;
-            Matrix4x4[]  bindPoses = smr.sharedMesh.bindposes;
-
-            s.PinBoneArray = new Transform[maxOrig + 1];
-            s.PinBindPoses = new Matrix4x4[maxOrig + 1];
-            foreach (int bi in usedBones)
-            {
-                s.PinBoneArray[bi] = (bones != null && bi < bones.Length) ? bones[bi] : null;
-                s.PinBindPoses[bi] = (bindPoses != null && bi < bindPoses.Length) ? bindPoses[bi] : Matrix4x4.identity;
-            }
-
-            var pins = new List<ClothBonePinData>();
-            if (bw != null)
-            {
-                for (int i = 0; i < s.VertCount && i < bw.Length; i++)
-                {
-                    if (!s.IsPinned[i]) continue;
-                    Vector3 restBindPos = (bindVerts != null && i < bindVerts.Length) ? bindVerts[i] : Vector3.zero;
-                    pins.Add(new ClothBonePinData
-                    {
-                        VertexIndex = i,
-                        BoneIndices  = new int[]  { bw[i].boneIndex0, bw[i].boneIndex1, bw[i].boneIndex2, bw[i].boneIndex3 },
-                        BoneWeights  = new float[]{ bw[i].weight0,    bw[i].weight1,    bw[i].weight2,    bw[i].weight3    },
-                        RestPos      = restBindPos
-                    });
-                }
-            }
-            s.PinData = pins.ToArray();
-
-            if (s.PinData.Length == 0 && chaCtrl != null)
-            {
-                float yMin = float.MaxValue, yMax = float.MinValue;
-                for (int i = 0; i < s.VertCount; i++)
-                {
-                    if (worldRest[i].y < yMin) yMin = worldRest[i].y;
-                    if (worldRest[i].y > yMax) yMax = worldRest[i].y;
-                }
-                float yThresh = yMin + (yMax - yMin) * 0.90f; // top 10 %
-
-                s.FallbackPinLocalPos = new Vector3[s.VertCount];
-                s.FallbackPinRoot     = chaCtrl.transform;
-                for (int i = 0; i < s.VertCount; i++)
-                {
-                    if (worldRest[i].y >= yThresh)
-                    {
-                        s.IsPinned[i]             = true;
-                        s.FallbackPinLocalPos[i]  = chaCtrl.transform.InverseTransformPoint(worldRest[i]);
-                    }
-                }
-            }
-        }
         private void BuildClothEntries()
         {
             entries.Clear();
@@ -762,7 +765,27 @@ namespace StudioModsMSG
                             CategoryId = catId,
                             MeshName   = smr.name,
                             Renderer   = smr,
+                            SkinBones  = smr.bones,
                         });
+                            // Pre-compute which bones dominate ≥1 vertex so the UI can hide
+                            // bones that wouldn't pin anything if selected.
+                            var dominantSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                            BoneWeight[] preWeights = smr.sharedMesh.boneWeights;
+                            Transform[]  preBones   = smr.bones;
+                            if (preWeights != null && preBones != null)
+                            {
+                                for (int pi = 0; pi < preWeights.Length; pi++)
+                                {
+                                    BoneWeight bw = preWeights[pi];
+                                    int dom = bw.boneIndex0; float dw = bw.weight0;
+                                    if (bw.weight1 > dw) { dw = bw.weight1; dom = bw.boneIndex1; }
+                                    if (bw.weight2 > dw) { dw = bw.weight2; dom = bw.boneIndex2; }
+                                    if (bw.weight3 > dw) { dom = bw.boneIndex3; }
+                                    if (dom >= 0 && dom < preBones.Length && preBones[dom] != null)
+                                        dominantSet.Add(preBones[dom].name);
+                                }
+                            }
+                            entry.Meshes[entry.Meshes.Count - 1].BonesWithDominantVertices = dominantSet;
                     }
 
                     if (entry.Meshes.Count > 0)

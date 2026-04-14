@@ -66,5 +66,11 @@ namespace StudioModsMSG
             ClothSoftBodyRuntime rt = GetOrCreateRuntime(selection);
             rt?.RefreshEntries();
         }
+
+        public void RecomputePins(SelectionContext selection, ClothMeshState state)
+        {
+            ClothSoftBodyRuntime rt = GetOrCreateRuntime(selection);
+            rt?.RecomputePinsFromSelectedBone(state);
+        }
     }
 }

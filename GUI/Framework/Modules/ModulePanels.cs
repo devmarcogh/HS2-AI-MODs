@@ -11,6 +11,8 @@ namespace StudioModsMSG
         void SyncEnabledState(ref bool enabled);
         void OnToggleChanged(bool enabled);
         void Draw(SelectionContext selection, BaseUI host);
+        bool TryCopyConfig(SelectionContext selection, out object config);
+        bool TryPasteConfig(SelectionContext selection, object config);
     }
 
     class InfoModulePanel : IModulePanelUI
@@ -50,6 +52,17 @@ namespace StudioModsMSG
             host.DrawStatRow("Runtime", available ? "Detected" : "Not detected", available ? host.SuccessColorRef : host.WarningColorRef);
             GUILayout.Space(8f);
             GUILayout.Label(available ? readyText : missingText, host.HintStyleRef);
+        }
+
+        public bool TryCopyConfig(SelectionContext selection, out object config)
+        {
+            config = null;
+            return false;
+        }
+
+        public bool TryPasteConfig(SelectionContext selection, object config)
+        {
+            return false;
         }
     }
 

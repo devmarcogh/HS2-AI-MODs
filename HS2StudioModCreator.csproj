@@ -123,6 +123,7 @@
     <Compile Include="Core\Mods\Integrations\Overlay\PluginOverlay.cs" />
     <Compile Include="GUI\BaseUI.cs" />
     <Compile Include="GUI\Mods\Cloth\ClothPhysicsPanel.cs" />
+      <Compile Include="GUI\GizmoDrawUtil.cs" />
     <Compile Include="GUI\Framework\Modules\ModulePanels.cs" />
     <Compile Include="GUI\Framework\Modules\ModulePanelFactory.cs" />
     <Compile Include="GUI\Mods\SoftBody\SoftBodyPanel.cs" />

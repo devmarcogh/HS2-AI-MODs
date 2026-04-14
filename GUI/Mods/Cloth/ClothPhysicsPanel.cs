@@ -1,46 +1,106 @@
+using System;
 using System.Collections.Generic;
 using UnityEngine;
 
 namespace StudioModsMSG
 {
-    /// <summary>
-    /// GUI panel for the Cloth Physics module.
-    ///
-    /// Layout:
-    ///   ┌─ scroll view ───────────────────────────────────────────────────── ┐
-    ///   │  [▶ Top]                        (category header — click to expand)│
-    ///   │      [x] o_top_a                                                   │
-    ///   │      [ ] o_top_b_cf_1           (mesh toggle)                      │
-    ///   │  [▼ Bottom]                                                        │
-    ///   │      [x] o_bot_a      ← selected mesh (bold)                       │
-    ///   └─────────────────────────────────────────────────────────────────── ┘
-    ///   ┌─ selected mesh settings (shown only when a mesh is selected) ────── ┐
-    ///   │   Stretch     ███████░░░ 600                                        │
-    ///   │   Bending     ██░░░░░░░░ 0.3                                        │
-    ///   │   Damping     ████░░░░░░ 5                                          │
-    ///   │   Thickness   █░░░░░░░░░ 0.012                                      │
-    ///   │   Gravity     ████░░░░░░ -9.8                                       │
-    ///   │   Substeps    1  [2]  3                                             │
-    ///   │   Iterations  1  2  [3]                                             │
-    ///   │   [x] Cloth-to-cloth collision                                      │
-    ///   └─────────────────────────────────────────────────────────────────── ┘
-    /// </summary>
     class ClothPhysicsPanel : IModulePanelUI
     {
         private readonly ClothPhysicsModule logic = new ClothPhysicsModule();
 
+        private sealed class ClothConfigSnapshot
+        {
+            public float StretchStiffness;
+            public float BendStiffness;
+            public float Damping;
+            public float Thickness;
+            public float Gravity;
+            public float Compression;
+            public float Substeps;
+            public float Iterations;
+            public bool ClothToCloth;
+            public List<string> PinSourceBoneNames;
+            public bool ShowPinBoneGizmos;
+        }
+
+        private sealed class BoneNode
+        {
+            public string Name;
+            public readonly List<BoneNode> Children = new List<BoneNode>();
+        }
+
+        private enum NodeSelectionState
+        {
+            None,
+            Partial,
+            All
+        }
+
         // GUI state
         private SelectionContext lastSelection;
         private ClothMeshState   selectedMesh;
-        private Vector2          listScroll    = Vector2.zero;
-        private Vector2          settingsScroll = Vector2.zero;
-        private const float ListHeight         = 180f;
+        private Vector2          listScroll = Vector2.zero;
+        private Vector2          boneScroll = Vector2.zero;
+        private const float      ListHeight = 170f;
+        private readonly Dictionary<ClothMeshState, HashSet<string>> expandedBoneNodesByMesh =
+            new Dictionary<ClothMeshState, HashSet<string>>();
 
         public string ModuleId => FeatureModuleIds.ClothPhysics;
 
         public bool GetDefaultEnabledState() => true;
         public void SyncEnabledState(ref bool enabled) { }
         public void OnToggleChanged(bool enabled) { }
+
+        public bool TryCopyConfig(SelectionContext selection, out object config)
+        {
+            config = null;
+            if (selectedMesh == null || selectedMesh.Params == null) return false;
+
+            ClothPhysicsParams p = selectedMesh.Params;
+            config = new ClothConfigSnapshot
+            {
+                StretchStiffness = p.StretchStiffness,
+                BendStiffness = p.BendStiffness,
+                Damping = p.Damping,
+                Thickness = p.Thickness,
+                Gravity = p.Gravity,
+                Compression = p.Compression,
+                Substeps = p.Substeps,
+                Iterations = p.Iterations,
+                ClothToCloth = p.ClothToCloth,
+                PinSourceBoneNames = new List<string>(selectedMesh.PinSourceBoneNames ?? new List<string>()),
+                ShowPinBoneGizmos = selectedMesh.ShowPinBoneGizmos,
+            };
+            return true;
+        }
+
+        public bool TryPasteConfig(SelectionContext selection, object config)
+        {
+            ClothConfigSnapshot snap = config as ClothConfigSnapshot;
+            if (snap == null || selectedMesh == null || selectedMesh.Params == null) return false;
+
+            ClothPhysicsParams p = selectedMesh.Params;
+            p.StretchStiffness = snap.StretchStiffness;
+            p.BendStiffness = snap.BendStiffness;
+            p.Damping = snap.Damping;
+            p.Thickness = snap.Thickness;
+            p.Gravity = snap.Gravity;
+            p.Compression = snap.Compression;
+            p.Substeps = snap.Substeps;
+            p.Iterations = snap.Iterations;
+            p.ClothToCloth = snap.ClothToCloth;
+            selectedMesh.ShowPinBoneGizmos = snap.ShowPinBoneGizmos;
+
+            selectedMesh.PinSourceBoneNames.Clear();
+            if (snap.PinSourceBoneNames != null)
+            {
+                for (int i = 0; i < snap.PinSourceBoneNames.Count; i++)
+                    AddBone(selectedMesh.PinSourceBoneNames, snap.PinSourceBoneNames[i]);
+            }
+
+            logic.RecomputePins(selection, selectedMesh);
+            return true;
+        }
 
         public void Draw(SelectionContext selection, BaseUI host)
         {
@@ -94,7 +154,6 @@ namespace StudioModsMSG
                         logic.ToggleMesh(selection, ms);
 
                     // Mesh name button (selects it for settings panel)
-                    GUIStyle btnStyle = isSelected ? host.HintStyleRef : host.HintStyleRef;
                     string label = isSelected ? "► " + ms.MeshName : "   " + ms.MeshName;
                     if (GUILayout.Button(label, host.HintStyleRef, GUILayout.ExpandWidth(true), GUILayout.Height(22f)))
                         selectedMesh = (selectedMesh == ms) ? null : ms;
@@ -130,8 +189,6 @@ namespace StudioModsMSG
 
             ClothPhysicsParams p = selectedMesh.Params;
 
-            settingsScroll = GUILayout.BeginScrollView(settingsScroll, GUILayout.ExpandHeight(false));
-
             DrawFloatRow(host, "Stretch",   ref p.StretchStiffness, 10f,    2000f);
             DrawFloatRow(host, "Bending",   ref p.BendStiffness,    0f,     2f);
             DrawFloatRow(host, "Damping",   ref p.Damping,          0f,     40f);
@@ -140,8 +197,8 @@ namespace StudioModsMSG
             DrawFloatRow(host, "Compression", ref p.Compression,       0f,     1f);
 
             GUILayout.Space(4f);
-            DrawIntRow(host, "Substeps",   ref p.Substeps,   1, 4);
-            DrawIntRow(host, "Iterations", ref p.Iterations, 1, 6);
+            DrawPresetRow(host, "Substeps",   ref p.Substeps);
+            DrawPresetRow(host, "Iterations", ref p.Iterations);
 
             GUILayout.Space(4f);
             GUILayout.BeginHorizontal();
@@ -149,12 +206,240 @@ namespace StudioModsMSG
             p.ClothToCloth = GUILayout.Toggle(p.ClothToCloth, p.ClothToCloth ? "On" : "Off", GUILayout.Width(40f));
             GUILayout.EndHorizontal();
 
-            GUILayout.EndScrollView();
+            // ── Pinning by source bones (treeview) ───────────────────────────────────
+            GUILayout.Space(8f);
+            GUILayout.Label("Pin Source Bones  (dominant vertices become pinned)", host.HintStyleRef);
+            GUILayout.Space(2f);
+
+            DrawBoneTree(host, selectedMesh);
+
+            GUILayout.Space(4f);
+            GUILayout.BeginHorizontal();
+            if (GUILayout.Button("Select All", GUILayout.Height(24f), GUILayout.Width(90f)))
+                SelectAllBones(selectedMesh);
+            if (GUILayout.Button("Unselect All", GUILayout.Height(24f), GUILayout.Width(90f)))
+                selectedMesh.PinSourceBoneNames.Clear();
+            selectedMesh.ShowPinBoneGizmos = GUILayout.Toggle(selectedMesh.ShowPinBoneGizmos, "Show Gizmos", GUILayout.Width(100f));
+            GUILayout.EndHorizontal();
+
+            GUILayout.BeginHorizontal();
+            if (GUILayout.Button("Apply Pins", GUILayout.Height(26f), GUILayout.Width(90f)))
+                logic.RecomputePins(lastSelection, selectedMesh);
+            GUILayout.EndHorizontal();
+
+            int pinned = 0;
+            if (selectedMesh.IsPinned != null)
+                for (int i = 0; i < selectedMesh.IsPinned.Length; i++)
+                    if (selectedMesh.IsPinned[i]) pinned++;
+
+            host.DrawStatRow("Selected Bones", selectedMesh.PinSourceBoneNames.Count.ToString(), host.HintStyleRef.normal.textColor);
+            host.DrawStatRow("Pinned Verts", pinned.ToString(), host.HintStyleRef.normal.textColor);
         }
 
         // ------------------------------------------------------------------ //
         // Helpers
         // ------------------------------------------------------------------ //
+
+        private void DrawBoneTree(BaseUI host, ClothMeshState ms)
+        {
+            List<BoneNode> roots = BuildBoneTree(ms);
+
+            boneScroll = GUILayout.BeginScrollView(boneScroll, GUILayout.Height(180f));
+            for (int i = 0; i < roots.Count; i++)
+                DrawBoneNodeRow(host, ms, roots[i], 0);
+            GUILayout.EndScrollView();
+        }
+
+        private void DrawBoneNodeRow(BaseUI host, ClothMeshState ms, BoneNode node, int depth)
+        {
+            HashSet<string> expanded = GetExpandedSet(ms);
+            bool hasChildren = node.Children.Count > 0;
+            bool isExpanded = expanded.Contains(node.Name);
+            NodeSelectionState state = GetNodeSelectionState(ms.PinSourceBoneNames, node);
+
+            GUILayout.BeginHorizontal();
+            GUILayout.Space(8f + depth * 14f);
+
+            if (hasChildren)
+            {
+                string fold = isExpanded ? "▼" : "▶";
+                if (GUILayout.Button(fold, GUILayout.Width(20f), GUILayout.Height(20f)))
+                {
+                    if (isExpanded) expanded.Remove(node.Name);
+                    else expanded.Add(node.Name);
+                }
+            }
+            else
+            {
+                GUILayout.Space(22f);
+            }
+
+            string stateText = state == NodeSelectionState.All ? "[x]" : (state == NodeSelectionState.Partial ? "[-]" : "[ ]");
+            string rowText = stateText + " " + node.Name;
+            if (GUILayout.Button(rowText, host.HintStyleRef, GUILayout.ExpandWidth(true), GUILayout.Height(20f)))
+            {
+                if (state == NodeSelectionState.All) RemoveNodeRecursive(ms.PinSourceBoneNames, node);
+                else AddNodeRecursive(ms.PinSourceBoneNames, node);
+            }
+
+            GUILayout.EndHorizontal();
+
+            if (hasChildren && isExpanded)
+            {
+                for (int i = 0; i < node.Children.Count; i++)
+                    DrawBoneNodeRow(host, ms, node.Children[i], depth + 1);
+            }
+        }
+
+        private void SelectAllBones(ClothMeshState ms)
+        {
+            ms.PinSourceBoneNames.Clear();
+            List<BoneNode> roots = BuildBoneTree(ms);
+            for (int i = 0; i < roots.Count; i++)
+                AddNodeRecursive(ms.PinSourceBoneNames, roots[i]);
+        }
+
+        private List<BoneNode> BuildBoneTree(ClothMeshState ms)
+        {
+            var roots = new List<BoneNode>();
+            if (ms == null || ms.SkinBones == null) return roots;
+
+            var validNames = GetValidBoneNames(ms);
+            var boneByName = new Dictionary<string, Transform>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < ms.SkinBones.Length; i++)
+            {
+                Transform b = ms.SkinBones[i];
+                if (b == null || string.IsNullOrEmpty(b.name)) continue;
+                if (!validNames.Contains(b.name)) continue;
+                if (!boneByName.ContainsKey(b.name)) boneByName[b.name] = b;
+            }
+
+            var nodeByName = new Dictionary<string, BoneNode>(StringComparer.OrdinalIgnoreCase);
+            foreach (var kv in boneByName)
+                nodeByName[kv.Key] = new BoneNode { Name = kv.Key };
+
+            foreach (var kv in boneByName)
+            {
+                string childName = kv.Key;
+                Transform parent = kv.Value.parent;
+                BoneNode childNode = nodeByName[childName];
+
+                // compress hierarchy to the nearest valid ancestor so we keep
+                // tree behavior without introducing bones that have no vertices.
+                BoneNode parentNode = null;
+                while (parent != null)
+                {
+                    if (!string.IsNullOrEmpty(parent.name) && nodeByName.TryGetValue(parent.name, out parentNode))
+                        break;
+                    parent = parent.parent;
+                }
+
+                if (parentNode != null)
+                    parentNode.Children.Add(childNode);
+                else
+                    roots.Add(childNode);
+            }
+
+            SortTreeRecursive(roots);
+            return roots;
+        }
+
+        private static HashSet<string> GetValidBoneNames(ClothMeshState ms)
+        {
+            var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (ms == null || ms.SkinBones == null) return names;
+
+            bool hasDomSet = ms.BonesWithDominantVertices != null && ms.BonesWithDominantVertices.Count > 0;
+            for (int i = 0; i < ms.SkinBones.Length; i++)
+            {
+                Transform bone = ms.SkinBones[i];
+                if (bone == null || string.IsNullOrEmpty(bone.name)) continue;
+                if (hasDomSet && !ms.BonesWithDominantVertices.Contains(bone.name)) continue;
+                names.Add(bone.name);
+            }
+            return names;
+        }
+
+        private static void SortTreeRecursive(List<BoneNode> nodes)
+        {
+            nodes.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
+            for (int i = 0; i < nodes.Count; i++)
+                SortTreeRecursive(nodes[i].Children);
+        }
+
+        private HashSet<string> GetExpandedSet(ClothMeshState ms)
+        {
+            HashSet<string> expanded;
+            if (!expandedBoneNodesByMesh.TryGetValue(ms, out expanded))
+            {
+                expanded = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                expandedBoneNodesByMesh[ms] = expanded;
+            }
+            return expanded;
+        }
+
+        private static void AddNodeRecursive(List<string> selected, BoneNode node)
+        {
+            AddBone(selected, node.Name);
+            for (int i = 0; i < node.Children.Count; i++)
+                AddNodeRecursive(selected, node.Children[i]);
+        }
+
+        private static void RemoveNodeRecursive(List<string> selected, BoneNode node)
+        {
+            RemoveBone(selected, node.Name);
+            for (int i = 0; i < node.Children.Count; i++)
+                RemoveNodeRecursive(selected, node.Children[i]);
+        }
+
+        private static NodeSelectionState GetNodeSelectionState(List<string> selected, BoneNode node)
+        {
+            int total = CountNodesRecursive(node);
+            int selectedCount = CountSelectedRecursive(selected, node);
+            if (selectedCount <= 0) return NodeSelectionState.None;
+            if (selectedCount >= total) return NodeSelectionState.All;
+            return NodeSelectionState.Partial;
+        }
+
+        private static int CountNodesRecursive(BoneNode node)
+        {
+            int count = 1;
+            for (int i = 0; i < node.Children.Count; i++)
+                count += CountNodesRecursive(node.Children[i]);
+            return count;
+        }
+
+        private static int CountSelectedRecursive(List<string> selected, BoneNode node)
+        {
+            int count = ContainsBone(selected, node.Name) ? 1 : 0;
+            for (int i = 0; i < node.Children.Count; i++)
+                count += CountSelectedRecursive(selected, node.Children[i]);
+            return count;
+        }
+
+        private static bool ContainsBone(List<string> bones, string boneName)
+        {
+            if (bones == null || string.IsNullOrEmpty(boneName)) return false;
+            for (int i = 0; i < bones.Count; i++)
+                if (string.Equals(bones[i], boneName, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            return false;
+        }
+
+        private static void AddBone(List<string> bones, string boneName)
+        {
+            if (bones == null || string.IsNullOrEmpty(boneName)) return;
+            if (!ContainsBone(bones, boneName)) bones.Add(boneName);
+        }
+
+        private static void RemoveBone(List<string> bones, string boneName)
+        {
+            if (bones == null || string.IsNullOrEmpty(boneName)) return;
+            for (int i = bones.Count - 1; i >= 0; i--)
+                if (string.Equals(bones[i], boneName, StringComparison.OrdinalIgnoreCase))
+                    bones.RemoveAt(i);
+        }
+
         private static void DrawFloatRow(BaseUI host, string label, ref float value, float min, float max)
         {
             Rect rowRect = GUILayoutUtility.GetRect(10f, 40f, GUILayout.ExpandWidth(true));
@@ -166,14 +451,17 @@ namespace StudioModsMSG
             if (!Mathf.Approximately(newVal, value)) value = newVal;
         }
 
-        private static void DrawIntRow(BaseUI host, string label, ref int value, int min, int max)
+        private static void DrawPresetRow(BaseUI host, string label, ref float value)
         {
+            float[] options = { 0.25f, 0.5f, 0.75f, 1f };
             GUILayout.BeginHorizontal();
             GUILayout.Label(label, host.HintStyleRef, GUILayout.Width(100f));
-            for (int v = min; v <= max; v++)
+            for (int i = 0; i < options.Length; i++)
             {
-                bool selected = (value == v);
-                string btnTxt = selected ? "[" + v + "]" : " " + v + " ";
+                float v = options[i];
+                bool selected = Mathf.Abs(value - v) <= 0.0001f;
+                string txt = v.ToString("0.##");
+                string btnTxt = selected ? "[" + txt + "]" : " " + txt + " ";
                 if (GUILayout.Button(btnTxt, host.HintStyleRef, GUILayout.Width(30f), GUILayout.Height(22f)))
                     value = v;
             }

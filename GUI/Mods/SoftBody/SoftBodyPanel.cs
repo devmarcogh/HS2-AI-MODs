@@ -10,6 +10,20 @@ namespace StudioModsMSG
     {
         private readonly SoftBodyModuleLogic logic = new SoftBodyModuleLogic();
 
+        private sealed class SoftBodyConfigSnapshot
+        {
+            public float Intensity;
+            public float Stiffness;
+            public float Damping;
+            public float MotionInfluence;
+            public float MaxOffset;
+            public float WeightThreshold;
+            public float WaveSpeed;
+            public float LateralStrength;
+            public float SecondaryAmplitude;
+            public float GravitySag;
+        }
+
         public string ModuleId => FeatureModuleIds.SoftBody;
 
         public bool GetDefaultEnabledState()
@@ -59,6 +73,42 @@ namespace StudioModsMSG
             host.DrawFloatSliderSetting("Gravity Sag", logic.GravitySag, 0f, 0.05f);
             GUILayout.Space(6f);
             GUILayout.Label("SoftBody physics simulates natural breast movement. Adjust sliders to fine-tune the effect.", host.HintStyleRef);
+        }
+
+        public bool TryCopyConfig(SelectionContext selection, out object config)
+        {
+            config = new SoftBodyConfigSnapshot
+            {
+                Intensity = logic.Intensity.Value,
+                Stiffness = logic.Stiffness.Value,
+                Damping = logic.Damping.Value,
+                MotionInfluence = logic.MotionInfluence.Value,
+                MaxOffset = logic.MaxOffset.Value,
+                WeightThreshold = logic.WeightThreshold.Value,
+                WaveSpeed = logic.WaveSpeed.Value,
+                LateralStrength = logic.LateralStrength.Value,
+                SecondaryAmplitude = logic.SecondaryAmplitude.Value,
+                GravitySag = logic.GravitySag.Value,
+            };
+            return true;
+        }
+
+        public bool TryPasteConfig(SelectionContext selection, object config)
+        {
+            SoftBodyConfigSnapshot snap = config as SoftBodyConfigSnapshot;
+            if (snap == null) return false;
+
+            logic.Intensity.Value = snap.Intensity;
+            logic.Stiffness.Value = snap.Stiffness;
+            logic.Damping.Value = snap.Damping;
+            logic.MotionInfluence.Value = snap.MotionInfluence;
+            logic.MaxOffset.Value = snap.MaxOffset;
+            logic.WeightThreshold.Value = snap.WeightThreshold;
+            logic.WaveSpeed.Value = snap.WaveSpeed;
+            logic.LateralStrength.Value = snap.LateralStrength;
+            logic.SecondaryAmplitude.Value = snap.SecondaryAmplitude;
+            logic.GravitySag.Value = snap.GravitySag;
+            return true;
         }
     }
 }

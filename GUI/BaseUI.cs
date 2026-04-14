@@ -75,29 +75,32 @@ namespace StudioModsMSG
         private readonly List<string> compatibleModuleNames = new List<string>();
         private readonly Dictionary<string, bool> moduleToggleStates = new Dictionary<string, bool>();
         private readonly Dictionary<string, IModulePanelUI> modulePanels = new Dictionary<string, IModulePanelUI>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, object> moduleConfigClipboard = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
         private string selectedModuleId;
         private Vector2 moduleDrawerScroll = Vector2.zero;
+        private Vector2 moduleContentScroll = Vector2.zero;
 
         private bool IsDarkMode => StudioCharaEditor.UIDarkMode != null && StudioCharaEditor.UIDarkMode.Value;
-        private Color WindowBackgroundColor => IsDarkMode ? Color.black : Color.white;
-        private Color HeaderBackgroundColor => IsDarkMode ? Color.black : Color.white;
-        private Color CardBackgroundColor => IsDarkMode ? Color.black : Color.white;
-        private Color AccentColor => IsDarkMode ? Color.black : Color.white;
-        private Color AccentSoftColor => IsDarkMode ? Color.white : Color.black;
-        private Color SuccessColor => IsDarkMode ? Color.white : Color.black;
-        private Color WarningColor => IsDarkMode ? Color.white : Color.black;
-        private Color TextPrimaryColor => IsDarkMode ? Color.white : Color.black;
-        private Color TextSecondaryColor => IsDarkMode ? Color.white : Color.black;
-        private Color BorderColor => IsDarkMode ? Color.white : Color.black;
-        private Color DrawerBackgroundColor => IsDarkMode ? Color.black : Color.white;
-        private Color DrawerItemColor => IsDarkMode ? Color.black : Color.white;
-        private Color DrawerItemSelectedColor => IsDarkMode ? Color.white : Color.black;
-        private Color ToggleOffColor => IsDarkMode ? Color.black : Color.white;
-        private Color ToggleOnColor => IsDarkMode ? Color.white : Color.black;
-        private Color SliderTrackColor => IsDarkMode ? Color.black : Color.white;
-        private Color SliderThumbColor => IsDarkMode ? Color.white : Color.black;
-        private Color ScrollTrackColor => IsDarkMode ? Color.black : Color.white;
-        private Color ScrollThumbColor => IsDarkMode ? Color.white : Color.black;
+        // Translucent glass palette ─────────────────────────────────────────
+        private Color WindowBackgroundColor  => IsDarkMode ? new Color(0.12f, 0.14f, 0.20f) : new Color(0.90f, 0.91f, 0.94f);
+        private Color HeaderBackgroundColor  => IsDarkMode ? new Color(0.10f, 0.12f, 0.18f) : new Color(0.82f, 0.83f, 0.87f);
+        private Color CardBackgroundColor    => IsDarkMode ? new Color(0.16f, 0.18f, 0.26f) : new Color(0.94f, 0.95f, 0.97f);
+        private Color AccentColor            => IsDarkMode ? new Color(0.22f, 0.75f, 0.88f) : new Color(0.05f, 0.38f, 0.72f);
+        private Color AccentSoftColor        => IsDarkMode ? new Color(0.13f, 0.15f, 0.25f) : new Color(0.80f, 0.84f, 0.91f);
+        private Color SuccessColor           => IsDarkMode ? new Color(0.28f, 0.90f, 0.48f) : new Color(0.04f, 0.58f, 0.22f);
+        private Color WarningColor           => IsDarkMode ? new Color(1.00f, 0.70f, 0.18f) : new Color(0.72f, 0.38f, 0.04f);
+        private Color TextPrimaryColor       => Color.white;
+        private Color TextSecondaryColor     => Color.white;
+        private Color BorderColor            => IsDarkMode ? new Color(0.28f, 0.34f, 0.52f) : new Color(0.52f, 0.56f, 0.66f);
+        private Color DrawerBackgroundColor  => IsDarkMode ? new Color(0.11f, 0.13f, 0.20f) : new Color(0.85f, 0.86f, 0.90f);
+        private Color DrawerItemColor        => IsDarkMode ? new Color(0.18f, 0.20f, 0.30f) : new Color(0.88f, 0.89f, 0.92f);
+        private Color DrawerItemSelectedColor=> IsDarkMode ? new Color(0.16f, 0.46f, 0.70f) : new Color(0.14f, 0.46f, 0.72f);
+        private Color ToggleOffColor         => IsDarkMode ? new Color(0.22f, 0.24f, 0.34f) : new Color(0.70f, 0.72f, 0.78f);
+        private Color ToggleOnColor          => IsDarkMode ? new Color(0.18f, 0.62f, 0.80f) : new Color(0.10f, 0.48f, 0.78f);
+        private Color SliderTrackColor       => IsDarkMode ? new Color(0.20f, 0.22f, 0.32f) : new Color(0.63f, 0.65f, 0.73f);
+        private Color SliderThumbColor       => IsDarkMode ? new Color(0.20f, 0.68f, 0.85f) : new Color(0.10f, 0.48f, 0.78f);
+        private Color ScrollTrackColor       => IsDarkMode ? new Color(0.18f, 0.20f, 0.30f) : new Color(0.73f, 0.74f, 0.78f);
+        private Color ScrollThumbColor       => IsDarkMode ? new Color(0.20f, 0.36f, 0.62f) : new Color(0.32f, 0.52f, 0.78f);
 
         public static Queue<Action> ToDoQueue = new Queue<Action>();
 
@@ -436,6 +439,9 @@ namespace StudioModsMSG
             DrawStatRow("Status", enabled ? "Enabled" : "Disabled", enabled ? SuccessColor : WarningColor);
             GUILayout.Space(8f);
 
+            DrawModuleClipboardRow(selection, selectedModule.ModuleId);
+            GUILayout.Space(6f);
+
             if (!enabled)
             {
                 GUILayout.Label("This module is turned off. Enable it from the drawer switch to edit its configuration.", hintStyle);
@@ -443,8 +449,13 @@ namespace StudioModsMSG
                 return;
             }
 
-            DrawModuleConfiguration(selection, selectedModule.ModuleId);
-            GUILayout.EndVertical();
+                moduleContentScroll = GUILayout.BeginScrollView(
+                    moduleContentScroll, false, true,
+                    GUIStyle.none, verticalScrollbarStyle,
+                    GUILayout.ExpandHeight(true));
+                DrawModuleConfiguration(selection, selectedModule.ModuleId);
+                GUILayout.EndScrollView();
+                GUILayout.EndVertical();
         }
 
         private void DrawModuleConfiguration(SelectionContext selection, string moduleId)
@@ -458,6 +469,36 @@ namespace StudioModsMSG
             }
 
             GUILayout.Label("No UI panel is registered for this module yet.", hintStyle);
+        }
+
+        private void DrawModuleClipboardRow(SelectionContext selection, string moduleId)
+        {
+            if (string.IsNullOrEmpty(moduleId) || !modulePanels.ContainsKey(moduleId)) return;
+            IModulePanelUI panel = modulePanels[moduleId];
+
+            bool hasCopy = panel != null;
+            bool hasPaste = panel != null && moduleConfigClipboard.ContainsKey(moduleId);
+
+            GUILayout.BeginHorizontal();
+            GUI.enabled = hasCopy;
+            if (GUILayout.Button("Copy Config", buttonStyle, GUILayout.Width(110f), GUILayout.Height(24f)))
+            {
+                object snapshot;
+                if (panel.TryCopyConfig(selection, out snapshot) && snapshot != null)
+                    moduleConfigClipboard[moduleId] = snapshot;
+            }
+
+            GUI.enabled = hasPaste;
+            if (GUILayout.Button("Paste Config", buttonStyle, GUILayout.Width(110f), GUILayout.Height(24f)))
+            {
+                object snapshot;
+                if (moduleConfigClipboard.TryGetValue(moduleId, out snapshot))
+                    panel.TryPasteConfig(selection, snapshot);
+            }
+            GUI.enabled = true;
+
+            GUILayout.FlexibleSpace();
+            GUILayout.EndHorizontal();
         }
 
         internal void DrawFloatSliderSetting(string label, ConfigEntry<float> entry, float minValue, float maxValue)
@@ -609,14 +650,14 @@ namespace StudioModsMSG
 
             float opacity = UIOpacity;
 
-            windowBackgroundTexture = MakeColorTexture(WithAlpha(WindowBackgroundColor, opacity * 0.95f));
-            headerBackgroundTexture = MakeColorTexture(WithAlpha(HeaderBackgroundColor, opacity));
-            cardBackgroundTexture   = MakeColorTexture(WithAlpha(CardBackgroundColor,   opacity * 0.85f));
-            accentTexture           = MakeColorTexture(AccentColor);
-            chipTexture             = MakeColorTexture(AccentSoftColor);
-            closeTexture            = MakeColorTexture(IsDarkMode ? Color.white : Color.black);
-            borderTexture           = MakeColorTexture(BorderColor);
-            drawerBackgroundTexture = MakeColorTexture(WithAlpha(DrawerBackgroundColor, opacity * 0.80f));
+            windowBackgroundTexture = MakeColorTexture(WithAlpha(WindowBackgroundColor, opacity * 0.68f));
+            headerBackgroundTexture = MakeColorTexture(WithAlpha(HeaderBackgroundColor, opacity * 0.80f));
+            cardBackgroundTexture   = MakeColorTexture(WithAlpha(CardBackgroundColor,   opacity * 0.60f));
+            accentTexture           = MakeColorTexture(WithAlpha(AccentColor,           1f));
+            chipTexture             = MakeColorTexture(WithAlpha(AccentSoftColor,        opacity * 0.65f));
+            closeTexture            = MakeColorTexture(WithAlpha(AccentColor,            1f));
+            borderTexture           = MakeColorTexture(WithAlpha(BorderColor,            opacity * 0.70f));
+            drawerBackgroundTexture = MakeColorTexture(WithAlpha(DrawerBackgroundColor,  opacity * 0.72f));
             drawerItemTexture         = MakeColorTexture(DrawerItemColor);
             drawerItemSelectedTexture = MakeColorTexture(DrawerItemSelectedColor);
             toggleOffTexture          = MakeColorTexture(ToggleOffColor);
@@ -668,15 +709,15 @@ namespace StudioModsMSG
             valueStyle.normal.textColor = TextPrimaryColor;
 
             rowLabelStyle = new GUIStyle(labelStyle);
-            rowLabelStyle.normal.textColor = IsDarkMode ? Color.black : Color.white;
+            rowLabelStyle.normal.textColor = Color.white;
 
             rowValueStyle = new GUIStyle(valueStyle);
-            rowValueStyle.normal.textColor = IsDarkMode ? Color.black : Color.white;
+            rowValueStyle.normal.textColor = Color.white;
 
             chipStyle = new GUIStyle(GUI.skin.label);
             chipStyle.normal.background = chipTexture;
             chipStyle.hover.background = chipTexture;
-            chipStyle.normal.textColor = AccentColor;
+            chipStyle.normal.textColor = Color.white;
             chipStyle.alignment = TextAnchor.MiddleCenter;
             chipStyle.padding = new RectOffset(12, 12, 4, 4);
             chipStyle.margin = new RectOffset(0, 8, 0, 0);
@@ -694,11 +735,11 @@ namespace StudioModsMSG
 
             buttonStyle = new GUIStyle(GUI.skin.button);
             buttonStyle.normal.background = chipTexture;
-            buttonStyle.normal.textColor = AccentColor;
+            buttonStyle.normal.textColor = Color.white;
             buttonStyle.hover.background = chipTexture;
-            buttonStyle.hover.textColor = AccentColor;
+            buttonStyle.hover.textColor = Color.white;
             buttonStyle.active.background = chipTexture;
-            buttonStyle.active.textColor = AccentColor;
+            buttonStyle.active.textColor = Color.white;
             buttonStyle.fontStyle = FontStyle.Bold;
             buttonStyle.border = new RectOffset(8, 8, 8, 8);
 
@@ -720,7 +761,7 @@ namespace StudioModsMSG
             drawerItemStyle.active.background = drawerItemSelectedTexture;
             drawerItemStyle.normal.textColor = TextPrimaryColor;
             drawerItemStyle.hover.textColor = TextPrimaryColor;
-            drawerItemStyle.active.textColor = IsDarkMode ? Color.black : Color.white;
+            drawerItemStyle.active.textColor = Color.white;
             drawerItemStyle.alignment = TextAnchor.MiddleLeft;
             drawerItemStyle.padding = new RectOffset(8, 8, 4, 4);
             drawerItemStyle.border = new RectOffset(8, 8, 8, 8);
@@ -729,9 +770,9 @@ namespace StudioModsMSG
             drawerItemSelectedStyle.normal.background = drawerItemSelectedTexture;
             drawerItemSelectedStyle.hover.background = drawerItemSelectedTexture;
             drawerItemSelectedStyle.active.background = drawerItemSelectedTexture;
-            drawerItemSelectedStyle.normal.textColor = IsDarkMode ? Color.black : Color.white;
-            drawerItemSelectedStyle.hover.textColor = IsDarkMode ? Color.black : Color.white;
-            drawerItemSelectedStyle.active.textColor = IsDarkMode ? Color.black : Color.white;
+            drawerItemSelectedStyle.normal.textColor = Color.white;
+            drawerItemSelectedStyle.hover.textColor = Color.white;
+            drawerItemSelectedStyle.active.textColor = Color.white;
             drawerItemSelectedStyle.fontStyle = FontStyle.Bold;
 
             moduleToggleStyle = new GUIStyle(GUI.skin.toggle);
@@ -741,12 +782,12 @@ namespace StudioModsMSG
             moduleToggleStyle.onHover.background = toggleOnTexture;
             moduleToggleStyle.active.background = toggleOffTexture;
             moduleToggleStyle.onActive.background = toggleOnTexture;
-            moduleToggleStyle.normal.textColor = IsDarkMode ? Color.white : Color.black;
-            moduleToggleStyle.onNormal.textColor = IsDarkMode ? Color.black : Color.white;
-            moduleToggleStyle.hover.textColor = IsDarkMode ? Color.white : Color.black;
-            moduleToggleStyle.onHover.textColor = IsDarkMode ? Color.black : Color.white;
-            moduleToggleStyle.active.textColor = IsDarkMode ? Color.white : Color.black;
-            moduleToggleStyle.onActive.textColor = IsDarkMode ? Color.black : Color.white;
+            moduleToggleStyle.normal.textColor = Color.white;
+            moduleToggleStyle.onNormal.textColor = Color.white;
+            moduleToggleStyle.hover.textColor = Color.white;
+            moduleToggleStyle.onHover.textColor = Color.white;
+            moduleToggleStyle.active.textColor = Color.white;
+            moduleToggleStyle.onActive.textColor = Color.white;
             moduleToggleStyle.alignment = TextAnchor.MiddleCenter;
             moduleToggleStyle.fontStyle = FontStyle.Bold;
             moduleToggleStyle.fixedWidth = 18f;
@@ -755,11 +796,11 @@ namespace StudioModsMSG
 
             closeButtonStyle = new GUIStyle(GUI.skin.button);
             closeButtonStyle.normal.background = closeTexture;
-            closeButtonStyle.normal.textColor = AccentColor;
+            closeButtonStyle.normal.textColor = Color.white;
             closeButtonStyle.hover.background = closeTexture;
-            closeButtonStyle.hover.textColor = AccentColor;
+            closeButtonStyle.hover.textColor = Color.white;
             closeButtonStyle.active.background = closeTexture;
-            closeButtonStyle.active.textColor = AccentColor;
+            closeButtonStyle.active.textColor = Color.white;
             closeButtonStyle.fontStyle = FontStyle.Bold;
             closeButtonStyle.alignment = TextAnchor.MiddleCenter;
 
@@ -805,8 +846,7 @@ namespace StudioModsMSG
             horizontalSliderThumbStyle.fixedWidth = 12f;
             horizontalSliderThumbStyle.fixedHeight = 16f;
 
-            GUI.skin.verticalScrollbarThumb = verticalScrollbarThumbStyle;
-            GUI.skin.horizontalScrollbarThumb = horizontalScrollbarThumbStyle;
+            // Do not mutate global GUI.skin here; leaking these styles affects other mods.
         }
 
         private void ResetStyles()

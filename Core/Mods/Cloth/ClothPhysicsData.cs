@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using UnityEngine;
 
@@ -14,24 +15,16 @@ namespace StudioModsMSG
         public float Damping          = 3f;     // higher damping to reduce oscillation
         public float Thickness        = 0.025f; // body-collision offset (metres)
         public float Gravity          = -5.0f;  // Y gravity (game units/s²; HS2 ≈ 1 unit = 1 m)
-        public int   Substeps         = 3;      // physics substeps per LateUpdate (more = stable)
-        public int   Iterations       = 12;     // xPBD constraint iterations per substep (12 = tight constraints, reduce tearing)
+        // Quality presets: 0.25 / 0.5 / 0.75 / 1.0
+        // Runtime maps these multipliers to concrete solver counts.
+        public float Substeps         = 1f;
+        public float Iterations       = 1f;
         public bool  ClothToCloth     = true;   // enable inter-cloth collision
-        // 0 = off; 1 = fully locked to rest pose. Pulls each free vertex back toward
-        // its rest position in character-root space, preventing cloth from ballooning.
+        // 0 = off; 1 = maximum.  Scales down the rest-edge target lengths so the
+        // fabric tries to shrink.  Body colliders prevent penetration, so the cloth
+        // presses inward and tightens against the body instead of ballooning.
+        // Does NOT freeze motion — it applies outward pressure against the body.
         public float Compression      = 0.05f;
-    }
-
-    // -----------------------------------------------------------------------
-    // Per-bone pin entry — used to recompute pin world positions each frame
-    // via manual skinning (no BakeMesh needed for pinned verts)
-    // -----------------------------------------------------------------------
-    struct ClothBonePinData
-    {
-        public int       VertexIndex;
-        public int[]     BoneIndices;  // up to 4
-        public float[]   BoneWeights;  // matching weights
-        public Vector3   RestPos;      // bind-pose local vertex position
     }
 
     // -----------------------------------------------------------------------
@@ -63,15 +56,21 @@ namespace StudioModsMSG
         public float[]   Mass;          // per-vertex mass
         public float[]   InvMass;       // 0 for pinned vertices
 
-        // -- Pin binding: bone-weight pins (standard; most cloth items) --
-        public Transform[]        PinBoneArray;   // bone transforms referenced by pins
-        public Matrix4x4[]        PinBindPoses;   // inverse-bind pose per bone slot
-        public ClothBonePinData[] PinData;
+        // -- Pinning by selected skin bones --
+        public List<string> PinSourceBoneNames = new List<string>(); // user-selected source bone names
+        public BoneWeight[] VertexBoneWeights;      // remapped to welded vertices
+        public Transform[] SkinBones;               // smr.bones snapshot
+        public Transform[] PinFollowBones;          // per-vertex follow transform (parent of dominant source bone)
+        public Vector3[]   PinFollowLocalPos;       // pinned-vertex local pos in PinFollowBones[i] space
 
-        // -- Pin binding: fallback root-relative pins (when mesh has no usable bone weights) --
-        // These verts are pinned to char root transform instead of individual bones.
-        public Vector3[]  FallbackPinLocalPos;  // position in chaCtrl.transform local space
-        public Transform  FallbackPinRoot;      // = chaCtrl.transform
+        // -- Debug visualization --
+        public bool   ShowPinBoneGizmos = true;
+        public string FocusBoneName;
+
+            // bones the user has starred so they appear at the top of the selector
+            public HashSet<string> PinFavoriteBoneNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            // bones that actually dominate ≥1 vertex in the mesh (pre-computed from smr.boneWeights at entry creation)
+            public HashSet<string> BonesWithDominantVertices;
 
         // -- Rendering (set on activation, cleaned on deactivation) --
         public Mesh         WorkMesh;           // owned working copy of rest-pose mesh
@@ -80,7 +79,7 @@ namespace StudioModsMSG
         public MeshCollider ClothCollider;      // runtime collider rebuilt from WorkMesh
         public Material[]   OriginalMaterials;  // saved from SMR on disable
         public Vector3[]    LocalVerts;         // cached buffer for WriteMesh (no GC per frame)
-        public Vector3[]    RestBodyLocalPos;   // rest world-pos stored in chaCtrl local space (for Compression)
+        public Vector3[]    RestBodyLocalPos;   // rest positions in chaCtrl local space (Compression + pinning)
 
         // -- Broadphase --
         public Bounds WorldBounds;
