@@ -16,6 +16,7 @@ namespace StudioModsMSG
             public float Thickness;
             public float Gravity;
             public float Compression;
+            public float Elasticity;
             public float Substeps;
             public float Iterations;
             public bool ClothToCloth;
@@ -65,6 +66,7 @@ namespace StudioModsMSG
                 Thickness = p.Thickness,
                 Gravity = p.Gravity,
                 Compression = p.Compression,
+                Elasticity = p.Elasticity,
                 Substeps = p.Substeps,
                 Iterations = p.Iterations,
                 ClothToCloth = p.ClothToCloth,
@@ -86,6 +88,7 @@ namespace StudioModsMSG
             p.Thickness = snap.Thickness;
             p.Gravity = snap.Gravity;
             p.Compression = snap.Compression;
+            p.Elasticity = snap.Elasticity;
             p.Substeps = snap.Substeps;
             p.Iterations = snap.Iterations;
             p.ClothToCloth = snap.ClothToCloth;
@@ -189,12 +192,13 @@ namespace StudioModsMSG
 
             ClothPhysicsParams p = selectedMesh.Params;
 
-            DrawFloatRow(host, "Stretch",   ref p.StretchStiffness, 10f,    2000f);
-            DrawFloatRow(host, "Bending",   ref p.BendStiffness,    0f,     2f);
-            DrawFloatRow(host, "Damping",   ref p.Damping,          0f,     40f);
-            DrawFloatRow(host, "Thickness", ref p.Thickness,        0.002f, 0.05f);
+            DrawFloatRow(host, "Stretch",   ref p.StretchStiffness, 0f,    5000f);
+            DrawFloatRow(host, "Bending",   ref p.BendStiffness,    0f,     20f);
+            DrawFloatRow(host, "Damping",   ref p.Damping,          1f,     10f);
+            DrawFloatRow(host, "Thickness", ref p.Thickness,        0.002f, 0.1f);
             DrawFloatRow(host, "Gravity",      ref p.Gravity,          -30f,   0f);
             DrawFloatRow(host, "Compression", ref p.Compression,       0f,     1f);
+            //DrawFloatRow(host, "Elasticity", ref p.Elasticity,       0f,     1f);
 
             GUILayout.Space(4f);
             DrawPresetRow(host, "Substeps",   ref p.Substeps);
@@ -206,7 +210,6 @@ namespace StudioModsMSG
             p.ClothToCloth = GUILayout.Toggle(p.ClothToCloth, p.ClothToCloth ? "On" : "Off", GUILayout.Width(40f));
             GUILayout.EndHorizontal();
 
-            // ── Pinning by source bones (treeview) ───────────────────────────────────
             GUILayout.Space(8f);
             GUILayout.Label("Pin Source Bones  (dominant vertices become pinned)", host.HintStyleRef);
             GUILayout.Space(2f);
@@ -236,9 +239,6 @@ namespace StudioModsMSG
             host.DrawStatRow("Pinned Verts", pinned.ToString(), host.HintStyleRef.normal.textColor);
         }
 
-        // ------------------------------------------------------------------ //
-        // Helpers
-        // ------------------------------------------------------------------ //
 
         private void DrawBoneTree(BaseUI host, ClothMeshState ms)
         {
@@ -453,7 +453,7 @@ namespace StudioModsMSG
 
         private static void DrawPresetRow(BaseUI host, string label, ref float value)
         {
-            float[] options = { 0.25f, 0.5f, 0.75f, 1f };
+            float[] options = { 0.25f, 0.5f, 0.75f, 1f,2f, 4f, 6f, 8f };
             GUILayout.BeginHorizontal();
             GUILayout.Label(label, host.HintStyleRef, GUILayout.Width(100f));
             for (int i = 0; i < options.Length; i++)

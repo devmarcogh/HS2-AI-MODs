@@ -14,7 +14,7 @@ namespace StudioModsMSG
         private const float SectionGap = 10f;
         private bool? lastAppliedDarkMode;
 
-        private readonly int windowID = 10123;
+        private readonly int windowID = 1205129726;
         private readonly string windowTitle = StudioCharaEditor.Name;
         private Rect windowRect = new Rect(0f, 300f, 640f, 360f);
         private bool mouseInWindow = false;

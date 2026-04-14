@@ -107,9 +107,10 @@
     <Compile Include="Core\CharaDetailInfo.cs" />
     <Compile Include="Core\CharaEditorController.cs" />
     <Compile Include="Core\CharaEditorMgr.cs" />
-    <Compile Include="Core\Mods\Cloth\ClothBodyProxy.cs" />
     <Compile Include="Core\Mods\Cloth\ClothPhysicsData.cs" />
     <Compile Include="Core\Mods\Cloth\ClothSoftBodyRuntime.cs" />
+      <Compile Include="Core\Mods\Cloth\ClothSoftBodyRuntime.cs" />
+    <Compile Include="Core\Mods\Cloth\BodyProxyCollider.cs" />
     <Compile Include="Core\Framework\Modules\CharacterEditorModule.cs" />
     <Compile Include="Core\Mods\Modules\ClothPhysicsModule.cs" />
     <Compile Include="Core\Mods\Modules\FeatureModules.cs" />

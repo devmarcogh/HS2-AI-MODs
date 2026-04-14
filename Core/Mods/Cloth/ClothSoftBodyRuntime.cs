@@ -18,13 +18,18 @@ namespace StudioModsMSG
     /// </summary>
     class ClothSoftBodyRuntime : MonoBehaviour
     {
+
+        
         private struct MirrorCollider
         {
             public Vector3 Center;
             public float Radius;
-            public float Height; 
-            public Vector3 Direction;
             public bool IsCapsule;
+            
+            // Pre-calculated Capsule Segment Math
+            public Vector3 P1;
+            public Vector3 V;
+            public float VDotV; 
         }
 
         private List<MirrorCollider> mirrorColliders = new List<MirrorCollider>();
@@ -34,20 +39,15 @@ namespace StudioModsMSG
             mirrorColliders.Clear();
             if (chaCtrl == null) return;
 
-            // Buscamos los componentes de Dynamic Bone en el personaje
             var dbColliders = chaCtrl.GetComponentsInChildren<DynamicBoneColliderBase>(true);
 
             foreach (var dbCol in dbColliders)
             {
                 if (!dbCol.enabled) continue;
 
-                // Intentamos obtener el radio y altura dinámicamente mediante reflexión 
-                // o asumiendo campos estándar si no puedes acceder a las clases derivadas
-                // Aquí usamos la lógica estándar de estos componentes:
                 float radius = 0;
                 float height = 0;
 
-                // Acceso seguro a propiedades comunes en implementaciones de DynamicBone
                 var type = dbCol.GetType();
                 var fRadius = type.GetField("m_Radius");
                 var fHeight = type.GetField("m_Height");
@@ -62,11 +62,19 @@ namespace StudioModsMSG
                 
                 if (mc.IsCapsule)
                 {
-                    mc.Height = height * Mathf.Abs(dbCol.transform.lossyScale.y);
+                    float actualHeight = height * Mathf.Abs(dbCol.transform.lossyScale.y);
                     Vector3 dir = Vector3.up;
                     if (dbCol.m_Direction == DynamicBoneColliderBase.Direction.X) dir = Vector3.right;
                     else if (dbCol.m_Direction == DynamicBoneColliderBase.Direction.Z) dir = Vector3.forward;
-                    mc.Direction = dbCol.transform.TransformDirection(dir);
+                    
+                    Vector3 worldDir = dbCol.transform.TransformDirection(dir);
+                    float halfH = Mathf.Max(0, actualHeight * 0.5f - mc.Radius);
+                    
+                    // Pre-calculate the capsule segment line for the solver
+                    mc.P1 = mc.Center + worldDir * halfH;
+                    Vector3 p2 = mc.Center - worldDir * halfH;
+                    mc.V = p2 - mc.P1;
+                    mc.VDotV = Vector3.Dot(mc.V, mc.V);
                 }
                 
                 mirrorColliders.Add(mc);
@@ -131,6 +139,9 @@ namespace StudioModsMSG
             if (chaCtrl == null || activeStates.Count == 0) return;
 
             // Character root movement this frame — used as follow-delta when no pins.
+
+            UpdateMirrorColliders();
+
             Vector3 chaPos = chaCtrl.transform.position;
             Vector3 chaMoveDelta = chaLastPosValid ? (chaPos - chaLastPos) : Vector3.zero;
             chaLastPos      = chaPos;
@@ -142,7 +153,7 @@ namespace StudioModsMSG
             {
                 if (state == null || state.Renderer == null) continue;
                 // Substeps is a quality multiplier (0.25..1). Map to concrete count.
-                int   substeps = Mathf.Max(1, Mathf.RoundToInt(4f * state.Params.Substeps));
+                int   substeps = Mathf.Max(1, Mathf.RoundToInt(state.Params.Substeps));
                 float subDt    = dt / substeps;
                 Vector3 subCharDelta = chaMoveDelta / substeps;
                 for (int sub = 0; sub < substeps; sub++)
@@ -166,10 +177,12 @@ namespace StudioModsMSG
         // Compliance α = 1/k.  Tilded compliance α̃ = α/dt² makes constraints
         // timestep-invariant — no parameter re-tuning needed when Substeps change.
         // ================================================================== //
+
+        private const float MaxCompressionRatio = 0.35f;
+
         private void SimulateStep(ClothMeshState s, float dt, Vector3 chaMoveDelta)
         {
             int n = s.VertCount;
-            UpdateMirrorColliders(); // Sincroniza el espejo en cada frame
 
             Array.Copy(s.Position, s.PrevPosition, n);
 
@@ -191,8 +204,7 @@ namespace StudioModsMSG
             float tildedCompliance = 1f / Mathf.Max(1e-6f, s.Params.StretchStiffness * dt * dt);
             float thick = s.Params.Thickness;
 
-            // Iterations is a quality multiplier (0.25..1). Map to concrete count.
-            int iterations = Mathf.Max(1, Mathf.RoundToInt(12f * s.Params.Iterations));
+            int iterations = Mathf.Max(1, Mathf.RoundToInt(s.Params.Iterations));
             for (int iter = 0; iter < iterations; iter++)
             {
                 SolveEdges_XPBD(s, tildedCompliance);
@@ -210,10 +222,8 @@ namespace StudioModsMSG
                         if (!col.IsCapsule) closest = col.Center;
                         else
                         {
-                            float halfH = Mathf.Max(0, col.Height * 0.5f - col.Radius);
-                            Vector3 p1 = col.Center + col.Direction * halfH;
-                            Vector3 p2 = col.Center - col.Direction * halfH;
-                            Vector3 v = p2 - p1;
+                            Vector3 p1 = col.P1;
+                            Vector3 v = col.V;
                             Vector3 w = p - p1;
                             float t = Mathf.Clamp01(Vector3.Dot(w, v) / Vector3.Dot(v, v));
                             closest = p1 + t * v;
@@ -246,12 +256,12 @@ namespace StudioModsMSG
         }
         // MaxCompressionRatio: at Compression=1 edges target 65% of rest length.
         // Keeping it below 50% avoids degeneracy while giving meaningful press-against-body effect.
-        private const float MaxCompressionRatio = 0.35f;
 
         private static void SolveEdges_XPBD(ClothMeshState s, float tildedCompliance)
         {
             // Compression scales down the target rest length so the fabric tries to shrink
             // and press against any colliding surface (the body). Does NOT freeze motion.
+            float elasticity = s.Params.Elasticity;
             float pressScale = 1f - s.Params.Compression * MaxCompressionRatio;
 
             for (int e = 0; e < s.Edges.Length; e += 2)
@@ -259,6 +269,9 @@ namespace StudioModsMSG
                 int i = s.Edges[e], j = s.Edges[e + 1];
                 float wi = s.IsPinned[i] ? 0f : s.InvMass[i];
                 float wj = s.IsPinned[j] ? 0f : s.InvMass[j];
+
+                if (wi == 0f && wj == 0f) continue;
+
                 float wSum = wi + wj + tildedCompliance;
                 if (wSum < 1e-10f) continue;
 

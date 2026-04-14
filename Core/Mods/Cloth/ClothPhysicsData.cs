@@ -25,6 +25,8 @@ namespace StudioModsMSG
         // presses inward and tightens against the body instead of ballooning.
         // Does NOT freeze motion — it applies outward pressure against the body.
         public float Compression      = 0.05f;
+        public float Elasticity      = 0.05f;
+
     }
 
     // -----------------------------------------------------------------------
