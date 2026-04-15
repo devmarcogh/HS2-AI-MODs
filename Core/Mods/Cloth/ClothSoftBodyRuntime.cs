@@ -1,6 +1,9 @@
 using AIChara;
 using System;
 using System.Collections.Generic;
+using System.Reflection;
+using System.Threading;
+using System.Threading.Tasks;
 using UnityEngine;
 
 namespace StudioModsMSG
@@ -32,54 +35,155 @@ namespace StudioModsMSG
             public float VDotV; 
         }
 
-        private List<MirrorCollider> mirrorColliders = new List<MirrorCollider>();
+        // ── Optimisation: MirrorCollider flat array (avoid List enumerator in hot loop) ──
+        private MirrorCollider[] _mirrorColArr = new MirrorCollider[64];
+        private int              _mirrorColCount;
+
+        // ── Optimisation: reflection cache for DynamicBoneCollider fields ──────────
+        private static FieldInfo _cachedFieldRadius;
+        private static FieldInfo _cachedFieldHeight;
+        private static bool      _reflectionCached;
+
+        // ── Optimisation: DynamicBoneCollider component cache ─────────────────────
+        private DynamicBoneColliderBase[] _dbColliderCache;
+        private int                       _dbColliderCacheFrame = -1;
+        private const int                 DbColliderCacheInterval = 30; // re-query every N frames
+
+        // ── Optimisation: MeshCollider throttle (PhysX mesh cook is very expensive) ──
+        private int _meshColliderFrame;
+        private const int MeshColliderUpdateInterval = 10;
+
+        // ── Optimisation: pin position snapshot (avoid repeated Transform reads) ──
+        private Vector3[] _pinSnapshot;
+
+        // ── Optimisation: cloth-to-cloth spatial hash grid ─────────────────────────
+        private readonly SpatialHashGrid _clothGrid     = new SpatialHashGrid();
+        private readonly List<int>       _clothQueryBuf = new List<int>(64);
+
+        // ── Optimisation: thread-local proxy query buffer for parallel collision ───
+        private ThreadLocal<List<int>> _tlProxyQueryBuf = new ThreadLocal<List<int>>(() => new List<int>(64));
+
+        // ── Auto-generated colliders ─────────────────────────────────────────────
+        private readonly List<AutoCapsuleState> _autoCapsules  = new List<AutoCapsuleState>();
+        private          BodyProxyCollider       _bodyProxy;
+        private readonly SpatialHashGrid         _proxyGrid     = new SpatialHashGrid();
+        private readonly List<int>               _proxyQueryBuf = new List<int>(64);
+
+        public bool UseAutoColliders   { get; private set; }
+        public bool UseProxyParticles  { get; private set; }
+        public int  AutoCapsuleCount   { get; private set; }
+        public int  ProxyParticleCount { get; private set; }
+
+        /// <summary>
+        /// Determines which collision source the solver uses each frame.
+        /// Manual = existing DynamicBone mirror colliders.
+        /// Auto   = auto-generated capsules + LBS proxy particles.
+        /// </summary>
+        public CollisionSourceMode CollisionSource { get; set; } = CollisionSourceMode.Manual;
+
+        private void EnsureMirrorCapacity(int needed)
+        {
+            if (_mirrorColArr.Length < needed)
+                _mirrorColArr = new MirrorCollider[Mathf.NextPowerOfTwo(needed)];
+        }
 
         private void UpdateMirrorColliders()
         {
-            mirrorColliders.Clear();
+            _mirrorColCount = 0;
             if (chaCtrl == null) return;
 
-            var dbColliders = chaCtrl.GetComponentsInChildren<DynamicBoneColliderBase>(true);
-
-            foreach (var dbCol in dbColliders)
+            // ── Manual source: mirror existing DynamicBone colliders ──────────
+            if (CollisionSource == CollisionSourceMode.Manual)
             {
-                if (!dbCol.enabled) continue;
-
-                float radius = 0;
-                float height = 0;
-
-                var type = dbCol.GetType();
-                var fRadius = type.GetField("m_Radius");
-                var fHeight = type.GetField("m_Height");
-
-                if (fRadius != null) radius = (float)fRadius.GetValue(dbCol);
-                if (fHeight != null) height = (float)fHeight.GetValue(dbCol);
-
-                MirrorCollider mc = new MirrorCollider();
-                mc.Center = dbCol.transform.TransformPoint(dbCol.m_Center);
-                mc.Radius = radius * Mathf.Abs(dbCol.transform.lossyScale.x);
-                mc.IsCapsule = height > 0;
-                
-                if (mc.IsCapsule)
+                // Cache GetComponentsInChildren — re-query only every N frames
+                int frame = Time.frameCount;
+                if (_dbColliderCache == null || (frame - _dbColliderCacheFrame) >= DbColliderCacheInterval)
                 {
-                    float actualHeight = height * Mathf.Abs(dbCol.transform.lossyScale.y);
-                    Vector3 dir = Vector3.up;
-                    if (dbCol.m_Direction == DynamicBoneColliderBase.Direction.X) dir = Vector3.right;
-                    else if (dbCol.m_Direction == DynamicBoneColliderBase.Direction.Z) dir = Vector3.forward;
-                    
-                    Vector3 worldDir = dbCol.transform.TransformDirection(dir);
-                    float halfH = Mathf.Max(0, actualHeight * 0.5f - mc.Radius);
-                    
-                    // Pre-calculate the capsule segment line for the solver
-                    mc.P1 = mc.Center + worldDir * halfH;
-                    Vector3 p2 = mc.Center - worldDir * halfH;
-                    mc.V = p2 - mc.P1;
-                    mc.VDotV = Vector3.Dot(mc.V, mc.V);
+                    _dbColliderCache = chaCtrl.GetComponentsInChildren<DynamicBoneColliderBase>(true);
+                    _dbColliderCacheFrame = frame;
                 }
-                
-                mirrorColliders.Add(mc);
+
+                // Cache reflection FieldInfo lookups (one-time cost)
+                if (!_reflectionCached)
+                {
+                    var sampleType = typeof(DynamicBoneCollider);
+                    _cachedFieldRadius = sampleType.GetField("m_Radius");
+                    _cachedFieldHeight = sampleType.GetField("m_Height");
+                    _reflectionCached  = true;
+                }
+
+                EnsureMirrorCapacity(_dbColliderCache.Length);
+
+                for (int ci = 0; ci < _dbColliderCache.Length; ci++)
+                {
+                    var dbCol = _dbColliderCache[ci];
+                    if (dbCol == null || !dbCol.enabled) continue;
+
+                    float radius = 0;
+                    float height = 0;
+
+                    if (_cachedFieldRadius != null) radius = (float)_cachedFieldRadius.GetValue(dbCol);
+                    if (_cachedFieldHeight != null) height = (float)_cachedFieldHeight.GetValue(dbCol);
+
+                    MirrorCollider mc = new MirrorCollider();
+                    mc.Center    = dbCol.transform.TransformPoint(dbCol.m_Center);
+                    mc.Radius    = radius * Mathf.Abs(dbCol.transform.lossyScale.x);
+                    mc.IsCapsule = height > 0;
+
+                    if (mc.IsCapsule)
+                    {
+                        float actualHeight = height * Mathf.Abs(dbCol.transform.lossyScale.y);
+                        Vector3 dir = Vector3.up;
+                        if (dbCol.m_Direction == DynamicBoneColliderBase.Direction.X) dir = Vector3.right;
+                        else if (dbCol.m_Direction == DynamicBoneColliderBase.Direction.Z) dir = Vector3.forward;
+
+                        Vector3 worldDir = dbCol.transform.TransformDirection(dir);
+                        float   halfH    = Mathf.Max(0, actualHeight * 0.5f - mc.Radius);
+
+                        mc.P1    = mc.Center + worldDir * halfH;
+                        Vector3 p2 = mc.Center - worldDir * halfH;
+                        mc.V     = p2 - mc.P1;
+                        mc.VDotV = Vector3.Dot(mc.V, mc.V);
+                    }
+
+                    _mirrorColArr[_mirrorColCount++] = mc;
+                }
+                return; // skip auto path
+            }
+
+            // ── Auto source: skin-weight capsules ─────────────────────────────
+            if (UseAutoColliders && _autoCapsules.Count > 0)
+            {
+                EnsureMirrorCapacity(_autoCapsules.Count);
+                for (int k = 0; k < _autoCapsules.Count; k++)
+                {
+                    AutoCapsuleState cap = _autoCapsules[k];
+                    if (cap.BoneTransform == null) continue;
+
+                    Matrix4x4 skinMatrix  = cap.BoneTransform.localToWorldMatrix * cap.BindPose;
+                    Vector3   worldCenter = skinMatrix.MultiplyPoint3x4(cap.MeshLocalCenter);
+                    Vector3   worldAxis   = skinMatrix.MultiplyVector(cap.MeshLocalAxis).normalized;
+                    float     scale       = Mathf.Abs(cap.BoneTransform.lossyScale.x);
+
+                    MirrorCollider mc = new MirrorCollider();
+                    mc.Center    = worldCenter;
+                    mc.Radius    = cap.Radius * scale;
+                    mc.IsCapsule = cap.HalfHeight > 0f;
+
+                    if (mc.IsCapsule)
+                    {
+                        float   halfH = cap.HalfHeight * scale;
+                        mc.P1         = worldCenter + worldAxis * halfH;
+                        Vector3 p2    = worldCenter - worldAxis * halfH;
+                        mc.V          = p2 - mc.P1;
+                        mc.VDotV      = Vector3.Dot(mc.V, mc.V);
+                    }
+
+                    _mirrorColArr[_mirrorColCount++] = mc;
+                }
             }
         }
+
         // ------------------------------------------------------------------ //
         // Character root tracking (follow when cloth has no bone-weight pins)
         // ------------------------------------------------------------------ //
@@ -142,6 +246,14 @@ namespace StudioModsMSG
 
             UpdateMirrorColliders();
 
+            // Update LBS proxy body particles once per frame before running any substep
+            if (CollisionSource == CollisionSourceMode.Auto &&
+                UseProxyParticles && _bodyProxy != null && _bodyProxy.ProxyCount > 0)
+            {
+                _bodyProxy.UpdateProxyPositions();
+                _proxyGrid.Build(_bodyProxy.AnimatedPositions, _bodyProxy.bodyParticleRadius * 2f);
+            }
+
             Vector3 chaPos = chaCtrl.transform.position;
             Vector3 chaMoveDelta = chaLastPosValid ? (chaPos - chaLastPos) : Vector3.zero;
             chaLastPos      = chaPos;
@@ -152,6 +264,10 @@ namespace StudioModsMSG
             foreach (ClothMeshState state in activeStates)
             {
                 if (state == null || state.Renderer == null) continue;
+
+                // Snapshot pinned positions once per frame (avoids repeated Transform reads per substep × iteration)
+                SnapshotPins(state);
+
                 // Substeps is a quality multiplier (0.25..1). Map to concrete count.
                 int   substeps = Mathf.Max(1, Mathf.RoundToInt(state.Params.Substeps));
                 float subDt    = dt / substeps;
@@ -192,7 +308,7 @@ namespace StudioModsMSG
                     if (!s.IsPinned[i]) { s.Position[i] += chaMoveDelta; s.PrevPosition[i] += chaMoveDelta; }
 
             // 2. Predict
-            float g = s.Params.Gravity;
+            float g = s.Params.Gravity * s.Params.Weight;
             for (int i = 0; i < n; i++)
             {
                 if (s.IsPinned[i]) { s.PredPosition[i] = s.Position[i]; continue; }
@@ -202,45 +318,49 @@ namespace StudioModsMSG
 
             // 3. Constraints Iterations
             float tildedCompliance = 1f / Mathf.Max(1e-6f, s.Params.StretchStiffness * dt * dt);
+            float bendCompliance   = 1f / Mathf.Max(1e-6f, s.Params.BendStiffness * dt * dt);
             float thick = s.Params.Thickness;
+
+            // Snapshot collider array reference + count for thread safety (immutable during iteration)
+            MirrorCollider[] colArr = _mirrorColArr;
+            int              colCnt = _mirrorColCount;
+
+            // Proxy collision state (captured once, read-only during collision pass)
+            bool   useProxy   = CollisionSource == CollisionSourceMode.Auto &&
+                                UseProxyParticles && _bodyProxy != null && _bodyProxy.ProxyCount > 0;
+            float  proxyRad   = useProxy ? _bodyProxy.bodyParticleRadius : 0f;
+            float  minSepP    = proxyRad + thick;
+            float  minSepSqP  = minSepP * minSepP;
+            Vector3[] proxyPos = useProxy ? _bodyProxy.AnimatedPositions : null;
 
             int iterations = Mathf.Max(1, Mathf.RoundToInt(s.Params.Iterations));
             for (int iter = 0; iter < iterations; iter++)
             {
                 SolveEdges_XPBD(s, tildedCompliance);
-                ApplyHardPins(s, s.PredPosition); // Vital para que no se caiga la ropa
+                if (s.BendPairs != null && s.BendPairs.Length > 0)
+                    SolveBends_XPBD(s, bendCompliance);
+                ApplySnapshotPins(s, s.PredPosition); // Use pre-snapshot positions (no Transform reads)
 
-                // Colisiones contra el espejo de DynamicBoneColliders
-                for (int i = 0; i < n; i++)
+                // Collision pass — parallel when vertex count justifies threading overhead
+                if (n > 256)
                 {
-                    if (s.IsPinned[i]) continue;
-                    Vector3 p = s.PredPosition[i];
-
-                    foreach (var col in mirrorColliders)
+                    Parallel.For(0, n, i =>
                     {
-                        Vector3 closest;
-                        if (!col.IsCapsule) closest = col.Center;
-                        else
-                        {
-                            Vector3 p1 = col.P1;
-                            Vector3 v = col.V;
-                            Vector3 w = p - p1;
-                            float t = Mathf.Clamp01(Vector3.Dot(w, v) / Vector3.Dot(v, v));
-                            closest = p1 + t * v;
-                        }
-
-                        Vector3 delta = p - closest;
-                        float distSq = delta.sqrMagnitude;
-                        float minSep = col.Radius + thick;
-
-                        if (distSq < minSep * minSep)
-                        {
-                            float dist = Mathf.Sqrt(distSq);
-                            Vector3 normal = (dist > 1e-6f) ? (delta / dist) : Vector3.up;
-                            p = closest + normal * minSep;
-                        }
+                        if (s.IsPinned[i]) return;
+                        s.PredPosition[i] = SolveVertexCollision(
+                            s.PredPosition[i], colArr, colCnt, thick,
+                            useProxy, proxyPos, minSepP, minSepSqP);
+                    });
+                }
+                else
+                {
+                    for (int i = 0; i < n; i++)
+                    {
+                        if (s.IsPinned[i]) continue;
+                        s.PredPosition[i] = SolveVertexCollision(
+                            s.PredPosition[i], colArr, colCnt, thick,
+                            useProxy, proxyPos, minSepP, minSepSqP);
                     }
-                    s.PredPosition[i] = p;
                 }
             }
 
@@ -254,6 +374,68 @@ namespace StudioModsMSG
                 s.Position[i] = s.PredPosition[i];
             }
         }
+
+        /// <summary>
+        /// Pure function: resolve collisions for a single vertex against all mirror colliders + proxy.
+        /// Thread-safe — no shared mutable state.
+        /// </summary>
+        private Vector3 SolveVertexCollision(
+            Vector3 p, MirrorCollider[] colArr, int colCnt, float thick,
+            bool useProxy, Vector3[] proxyPos, float minSepP, float minSepSqP)
+        {
+            // Mirror collider collision (capsules + spheres)
+            for (int c = 0; c < colCnt; c++)
+            {
+                MirrorCollider col = colArr[c];
+                Vector3 closest;
+                if (!col.IsCapsule) closest = col.Center;
+                else
+                {
+                    Vector3 w = p - col.P1;
+                    float t = Mathf.Clamp01(Vector3.Dot(w, col.V) / col.VDotV);
+                    closest = col.P1 + t * col.V;
+                }
+
+                Vector3 delta = p - closest;
+                float distSq = delta.sqrMagnitude;
+                float minSep = col.Radius + thick;
+
+                if (distSq < minSep * minSep)
+                {
+                    float dist = Mathf.Sqrt(distSq);
+                    Vector3 normal = (dist > 1e-6f) ? (delta / dist) : Vector3.up;
+                    p = closest + normal * minSep;
+                }
+            }
+
+            // Proxy particle collision — body-conforming region (e.g. breasts/belly)
+            if (useProxy && proxyPos != null)
+            {
+                // Thread-local query buffer to avoid contention
+                List<int> queryBuf = _tlProxyQueryBuf.Value;
+                _proxyGrid.Query(p, minSepP, queryBuf);
+                for (int qi = 0; qi < queryBuf.Count; qi++)
+                {
+                    Vector3 pd  = p - proxyPos[queryBuf[qi]];
+                    float   dSq = pd.sqrMagnitude;
+                    if (dSq < minSepSqP)
+                    {
+                        if (dSq > 1e-10f)
+                        {
+                            float dist = Mathf.Sqrt(dSq);
+                            p = proxyPos[queryBuf[qi]] + (pd / dist) * minSepP;
+                        }
+                        else
+                        {
+                            p = proxyPos[queryBuf[qi]] + Vector3.up * minSepP;
+                        }
+                    }
+                }
+            }
+
+            return p;
+        }
+
         // MaxCompressionRatio: at Compression=1 edges target 65% of rest length.
         // Keeping it below 50% avoids degeneracy while giving meaningful press-against-body effect.
 
@@ -261,7 +443,6 @@ namespace StudioModsMSG
         {
             // Compression scales down the target rest length so the fabric tries to shrink
             // and press against any colliding surface (the body). Does NOT freeze motion.
-            float elasticity = s.Params.Elasticity;
             float pressScale = 1f - s.Params.Compression * MaxCompressionRatio;
 
             for (int e = 0; e < s.Edges.Length; e += 2)
@@ -288,6 +469,33 @@ namespace StudioModsMSG
             }
         }
 
+        private static void SolveBends_XPBD(ClothMeshState s, float tildedCompliance)
+        {
+            for (int b = 0; b < s.BendPairs.Length; b += 2)
+            {
+                int i = s.BendPairs[b];
+                int j = s.BendPairs[b + 1];
+                float wi = s.IsPinned[i] ? 0f : s.InvMass[i];
+                float wj = s.IsPinned[j] ? 0f : s.InvMass[j];
+
+                if (wi == 0f && wj == 0f) continue;
+
+                float wSum = wi + wj + tildedCompliance;
+                if (wSum < 1e-10f) continue;
+
+                Vector3 d   = s.PredPosition[i] - s.PredPosition[j];
+                float   len = d.magnitude;
+                if (len < 1e-7f) continue;
+
+                float   C      = len - s.RestBendLen[b / 2];
+                float   lambda = -C / wSum;
+                Vector3 corr   = (d / len) * lambda;
+
+                if (!s.IsPinned[i]) s.PredPosition[i] += wi * corr;
+                if (!s.IsPinned[j]) s.PredPosition[j] -= wj * corr;
+            }
+        }
+
         private void ApplyClothToClothCollision(ClothMeshState s)
         {
             float twoT   = s.Params.Thickness * 2f;
@@ -298,13 +506,18 @@ namespace StudioModsMSG
                 if (other == s || !other.Params.ClothToCloth) continue;
                 if (!s.WorldBounds.Intersects(other.WorldBounds)) continue;
 
+                // Build spatial hash from the other mesh's positions for O(n+m) collision
+                _clothGrid.Build(other.Position, twoT);
+
                 for (int i = 0; i < s.VertCount; i++)
                 {
                     if (s.IsPinned[i]) continue;
                     Vector3 pi = s.Position[i];
 
-                    for (int j = 0; j < other.VertCount; j++)
+                    _clothGrid.Query(pi, twoT, _clothQueryBuf);
+                    for (int qi = 0; qi < _clothQueryBuf.Count; qi++)
                     {
+                        int j = _clothQueryBuf[qi];
                         if (other.IsPinned[j]) continue;
                         Vector3 d   = pi - other.Position[j];
                         float   dSq = d.sqrMagnitude;
@@ -324,21 +537,65 @@ namespace StudioModsMSG
         private void WriteMesh(ClothMeshState s)
         {
             if (s.WorkMesh == null || s.Filter == null || s.LocalVerts == null) return;
+
+            // Cache worldToLocalMatrix to avoid per-vertex virtual call overhead
             Transform tf = s.Renderer != null ? s.Renderer.transform : transform;
+            Matrix4x4 w2l = tf.worldToLocalMatrix;
             for (int i = 0; i < s.VertCount; i++)
-                s.LocalVerts[i] = tf.InverseTransformPoint(s.Position[i]);
+                s.LocalVerts[i] = w2l.MultiplyPoint3x4(s.Position[i]);
+
             s.WorkMesh.vertices = s.LocalVerts;
             s.WorkMesh.RecalculateBounds();   // CRITICAL: without this Unity frustum-culls the mesh
             s.WorkMesh.RecalculateNormals();
-            s.WorkMesh.RecalculateTangents();
 
-            // Force collider to pick up changed vertex positions.
-            if (s.ClothCollider != null)
+            // Tangents are expensive and rarely needed for cloth materials — skip by default
+            if (s.Params.NeedsTangents)
+                s.WorkMesh.RecalculateTangents();
+
+            // MeshCollider cook is very expensive — throttle to every N frames.
+            // The collider is only used for mouse picking in the editor, not for physics.
+            _meshColliderFrame++;
+            if (s.ClothCollider != null && (_meshColliderFrame % MeshColliderUpdateInterval == 0))
             {
                 s.ClothCollider.sharedMesh = null;
                 s.ClothCollider.sharedMesh = s.WorkMesh;
             }
         }
+
+        /// <summary>
+        /// Snapshots pinned vertex positions once per frame (main thread Transform reads).
+        /// Substeps and iterations then use the snapshot instead of repeated Transform.TransformPoint calls.
+        /// </summary>
+        private void SnapshotPins(ClothMeshState s)
+        {
+            if (s.PinFollowBones == null || s.PinFollowLocalPos == null) return;
+            int n = s.VertCount;
+            if (_pinSnapshot == null || _pinSnapshot.Length < n)
+                _pinSnapshot = new Vector3[n];
+
+            for (int i = 0; i < n; i++)
+            {
+                if (!s.IsPinned[i]) continue;
+                Transform follow = s.PinFollowBones[i];
+                if (follow == null) continue;
+                _pinSnapshot[i] = follow.TransformPoint(s.PinFollowLocalPos[i]);
+            }
+        }
+
+        /// <summary>
+        /// Applies pre-snapshot pin positions to a destination buffer (no Transform reads).
+        /// Used during substep iterations instead of ApplyHardPins.
+        /// </summary>
+        private void ApplySnapshotPins(ClothMeshState s, Vector3[] dst)
+        {
+            if (_pinSnapshot == null || s.PinFollowBones == null) return;
+            for (int i = 0; i < s.VertCount; i++)
+            {
+                if (!s.IsPinned[i]) continue;
+                dst[i] = _pinSnapshot[i];
+            }
+        }
+
         private void ApplyHardPins(ClothMeshState s, Vector3[] dst)
         {
             if (s.PinFollowBones == null || s.PinFollowLocalPos == null) return;
@@ -631,6 +888,7 @@ namespace StudioModsMSG
             RecomputePinsFromSelectedBone(state);
 
             BuildEdges(state, tris, worldRest);
+            BuildBends(state, tris, worldRest);
             // Mass and IsPinned are already set by RecomputePinsFromSelectedBone above.
 
             GameObject go = smr.gameObject;
@@ -741,6 +999,41 @@ namespace StudioModsMSG
             s.RestEdgeLen = restLens.ToArray();
         }
 
+        private static void BuildBends(ClothMeshState s, int[] tris, Vector3[] worldPosRest)
+        {
+            var edgeToOpposites = new Dictionary<long, List<int>>();
+
+            for (int t = 0; t < tris.Length; t += 3)
+            {
+                int a = tris[t];
+                int b = tris[t + 1];
+                int c = tris[t + 2];
+
+                AddBendEdge(edgeToOpposites, a, b, c);
+                AddBendEdge(edgeToOpposites, b, c, a);
+                AddBendEdge(edgeToOpposites, c, a, b);
+            }
+
+            var bendList = new List<int>();
+            var restLens = new List<float>();
+
+            foreach (var kv in edgeToOpposites)
+            {
+                if (kv.Value.Count != 2) continue;
+
+                int oppA = kv.Value[0];
+                int oppB = kv.Value[1];
+                if (oppA == oppB) continue;
+
+                bendList.Add(oppA);
+                bendList.Add(oppB);
+                restLens.Add((worldPosRest[oppA] - worldPosRest[oppB]).magnitude);
+            }
+
+            s.BendPairs = bendList.ToArray();
+            s.RestBendLen = restLens.ToArray();
+        }
+
         private static void AddEdge(int a, int b, HashSet<long> set, List<int> list, List<float> lens, Vector3[] pos)
         {
             int lo = Mathf.Min(a, b), hi = Mathf.Max(a, b);
@@ -748,6 +1041,21 @@ namespace StudioModsMSG
             if (!set.Add(key)) return;
             list.Add(lo); list.Add(hi);
             lens.Add((pos[lo] - pos[hi]).magnitude);
+        }
+
+        private static void AddBendEdge(Dictionary<long, List<int>> edgeToOpposites, int a, int b, int opposite)
+        {
+            int lo = Mathf.Min(a, b), hi = Mathf.Max(a, b);
+            long key = (long)lo << 32 | (uint)hi;
+
+            List<int> opposites;
+            if (!edgeToOpposites.TryGetValue(key, out opposites))
+            {
+                opposites = new List<int>(2);
+                edgeToOpposites[key] = opposites;
+            }
+
+            opposites.Add(opposite);
         }
 
         private void BuildClothEntries()
@@ -811,6 +1119,94 @@ namespace StudioModsMSG
             for (int i = activeStates.Count - 1; i >= 0; i--)
                 DeactivateMesh(activeStates[i]);
             BuildClothEntries();
+        }
+
+        // ================================================================== //
+        // Auto collider building
+        // ================================================================== //
+
+        /// <summary>
+        /// Builds per-bone capsule colliders and/or LBS proxy particle colliders from
+        /// the body SkinnedMeshRenderer.  Invoke this from the GUI whenever the
+        /// character's body proportions change.
+        /// </summary>
+        public void BuildAutoColliders(Dictionary<string, ColliderMode> boneGroupModes)
+        {
+            _autoCapsules.Clear();
+            UseAutoColliders   = false;
+            UseProxyParticles  = false;
+            AutoCapsuleCount   = 0;
+            ProxyParticleCount = 0;
+
+            if (chaCtrl == null || boneGroupModes == null) return;
+
+            SkinnedMeshRenderer bodySMR = FindBodySMR();
+            if (bodySMR == null) return;
+
+            Transform[] allBones = bodySMR.bones;
+
+            var capsuleBoneNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var proxyBoneNames   = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var kv in boneGroupModes)
+            {
+                if (kv.Value == ColliderMode.Off) continue;
+                var groupBones = AutoCapsuleBuilder.GetBoneNamesForGroup(allBones, kv.Key);
+                if (kv.Value == ColliderMode.Capsule)
+                    foreach (var b in groupBones) capsuleBoneNames.Add(b);
+                else if (kv.Value == ColliderMode.Proxy)
+                    foreach (var b in groupBones) proxyBoneNames.Add(b);
+            }
+
+            // Build capsule colliders
+            if (capsuleBoneNames.Count > 0)
+            {
+                var caps = AutoCapsuleBuilder.Build(bodySMR, capsuleBoneNames);
+                _autoCapsules.AddRange(caps);
+                UseAutoColliders = _autoCapsules.Count > 0;
+                AutoCapsuleCount = _autoCapsules.Count;
+            }
+
+            // Build proxy particle collider (filtered to proxy-group bones only)
+            if (proxyBoneNames.Count > 0)
+            {
+                if (_bodyProxy == null)
+                    _bodyProxy = gameObject.AddComponent<BodyProxyCollider>();
+
+                // Proxy mode needs denser points and larger particle radius than capsule mode.
+                _bodyProxy.decimationFactor = 2;
+                _bodyProxy.bodyParticleRadius = 0.03f;
+                _bodyProxy.Initialize(bodySMR, proxyBoneNames);
+
+                // Fallback: if filtering yields no proxy vertices, use full-body proxy to avoid silent no-collision.
+                if (_bodyProxy.ProxyCount <= 0)
+                    _bodyProxy.Initialize(bodySMR, null);
+
+                UseProxyParticles  = _bodyProxy.ProxyCount > 0;
+                ProxyParticleCount = _bodyProxy.ProxyCount;
+            }
+            else
+            {
+                if (_bodyProxy != null) { Destroy(_bodyProxy); _bodyProxy = null; }
+                UseProxyParticles  = false;
+                ProxyParticleCount = 0;
+            }
+        }
+
+        /// <summary>Returns the body SkinnedMeshRenderer with the most vertices.</summary>
+        private SkinnedMeshRenderer FindBodySMR()
+        {
+            if (chaCtrl.objBody == null) return null;
+            SkinnedMeshRenderer best     = null;
+            int                 bestVerts = 0;
+            var smrs = chaCtrl.objBody.GetComponentsInChildren<SkinnedMeshRenderer>(true);
+            foreach (var smr in smrs)
+            {
+                if (smr == null || smr.sharedMesh == null) continue;
+                int v = smr.sharedMesh.vertexCount;
+                if (v > bestVerts) { bestVerts = v; best = smr; }
+            }
+            return best;
         }
     }
 }

@@ -72,5 +72,15 @@ namespace StudioModsMSG
             ClothSoftBodyRuntime rt = GetOrCreateRuntime(selection);
             rt?.RecomputePinsFromSelectedBone(state);
         }
+
+        /// <summary>
+        /// Builds auto-capsule and proxy-particle colliders for the character
+        /// based on the per-group bone modes chosen in the GUI.
+        /// </summary>
+        public void RebuildColliders(SelectionContext selection, Dictionary<string, ColliderMode> boneGroupModes)
+        {
+            ClothSoftBodyRuntime rt = GetOrCreateRuntime(selection);
+            rt?.BuildAutoColliders(boneGroupModes);
+        }
     }
 }

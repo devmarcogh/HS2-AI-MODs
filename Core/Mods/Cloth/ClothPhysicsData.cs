@@ -10,11 +10,12 @@ namespace StudioModsMSG
     class ClothPhysicsParams
     {
         // xPBD compliance-based stiffness.  α̃ = 1/(k·dt²), lower k = stretchier cloth.
-        public float StretchStiffness = 8f;     // much lower now that pins are disabled
-        public float BendStiffness    = 0.05f;  // (reserved for future dihedral bending)
-        public float Damping          = 3f;     // higher damping to reduce oscillation
+        public float StretchStiffness = 120f;   // stronger defaults so cloth feels less rubbery
+        public float BendStiffness    = 6f;     // simple bend resistance from shared-edge opposite verts
+        public float Damping          = 5f;     // higher damping to reduce oscillation
         public float Thickness        = 0.025f; // body-collision offset (metres)
-        public float Gravity          = -5.0f;  // Y gravity (game units/s²; HS2 ≈ 1 unit = 1 m)
+        public float Gravity          = -9.81f; // Y gravity (game units/s²; HS2 ≈ 1 unit = 1 m)
+        public float Weight           = 1.35f;  // scales gravity/inertia feel without changing topology
         // Quality presets: 0.25 / 0.5 / 0.75 / 1.0
         // Runtime maps these multipliers to concrete solver counts.
         public float Substeps         = 1f;
@@ -25,7 +26,8 @@ namespace StudioModsMSG
         // presses inward and tightens against the body instead of ballooning.
         // Does NOT freeze motion — it applies outward pressure against the body.
         public float Compression      = 0.05f;
-        public float Elasticity      = 0.05f;
+        public float Elasticity       = 0.05f;  // legacy/reserved; StretchStiffness is primary control
+        public bool  NeedsTangents    = true;    // RecalculateTangents per frame (needed for normal-mapped materials)
 
     }
 
@@ -48,6 +50,8 @@ namespace StudioModsMSG
         public int[]   Tris;            // flat [a,b,c, a,b,c, ...] triangle list
         public int[]   Edges;           // flat [i,j, i,j, ...] deduplicated edges
         public float[] RestEdgeLen;     // rest length for each edge pair
+        public int[]   BendPairs;       // flat [i,j, i,j, ...] opposite verts across shared edges
+        public float[] RestBendLen;     // rest length for each bend pair
 
         // -- Per-vertex runtime (world space) --
         public Vector3[] Position;

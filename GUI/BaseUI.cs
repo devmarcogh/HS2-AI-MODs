@@ -31,6 +31,7 @@ namespace StudioModsMSG
         private GUIStyle titleStyle;
         private GUIStyle subtitleStyle;
         private GUIStyle cardStyle;
+        private bool _stylesReady;
         private GUIStyle labelStyle;
         private GUIStyle valueStyle;
         private GUIStyle sectionTitleStyle;
@@ -125,7 +126,6 @@ namespace StudioModsMSG
                 Math.Max(minWindowHeight, StudioCharaEditor.UIHeight.Value)
             );
 
-            EnsureStyles();
             EnsureModulePanels();
         }
 
@@ -423,6 +423,7 @@ namespace StudioModsMSG
 
         private void DrawSelectedModulePanel(SelectionContext selection)
         {
+            EnsureModulePanels(); // must run before DrawModuleClipboardRow checks modulePanels
             GUILayout.BeginVertical(GUILayout.ExpandWidth(true), GUILayout.ExpandHeight(true));
 
             IEditorModule selectedModule = selection.CompatibleModules.FirstOrDefault(module => string.Equals(module.ModuleId, selectedModuleId, StringComparison.OrdinalIgnoreCase));
@@ -641,10 +642,7 @@ namespace StudioModsMSG
 
         private void EnsureStyles()
         {
-            if (windowStyle != null)
-            {
-                return;
-            }
+            if (_stylesReady) return;
 
             lastAppliedDarkMode = IsDarkMode;
 
@@ -847,10 +845,12 @@ namespace StudioModsMSG
             horizontalSliderThumbStyle.fixedHeight = 16f;
 
             // Do not mutate global GUI.skin here; leaking these styles affects other mods.
+            _stylesReady = true;
         }
 
         private void ResetStyles()
         {
+            _stylesReady = false;
             windowStyle = null;
             headerStyle = null;
             titleStyle = null;

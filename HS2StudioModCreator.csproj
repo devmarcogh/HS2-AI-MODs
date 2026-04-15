@@ -109,8 +109,9 @@
     <Compile Include="Core\CharaEditorMgr.cs" />
     <Compile Include="Core\Mods\Cloth\ClothPhysicsData.cs" />
     <Compile Include="Core\Mods\Cloth\ClothSoftBodyRuntime.cs" />
-      <Compile Include="Core\Mods\Cloth\ClothSoftBodyRuntime.cs" />
     <Compile Include="Core\Mods\Cloth\BodyProxyCollider.cs" />
+    <Compile Include="Core\Mods\Cloth\AutoCapsuleCollider.cs" />
+    <Compile Include="Core\Mods\Cloth\SpatialHashGrid.cs" />
     <Compile Include="Core\Framework\Modules\CharacterEditorModule.cs" />
     <Compile Include="Core\Mods\Modules\ClothPhysicsModule.cs" />
     <Compile Include="Core\Mods\Modules\FeatureModules.cs" />

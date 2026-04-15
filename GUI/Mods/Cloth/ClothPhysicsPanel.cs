@@ -15,6 +15,7 @@ namespace StudioModsMSG
             public float Damping;
             public float Thickness;
             public float Gravity;
+            public float Weight;
             public float Compression;
             public float Elasticity;
             public float Substeps;
@@ -46,6 +47,10 @@ namespace StudioModsMSG
         private readonly Dictionary<ClothMeshState, HashSet<string>> expandedBoneNodesByMesh =
             new Dictionary<ClothMeshState, HashSet<string>>();
 
+        // Auto Colliders section state
+        private bool _autoCollidersExpanded = true;
+        private Dictionary<string, ColliderMode> _boneGroupModes;
+
         public string ModuleId => FeatureModuleIds.ClothPhysics;
 
         public bool GetDefaultEnabledState() => true;
@@ -65,6 +70,7 @@ namespace StudioModsMSG
                 Damping = p.Damping,
                 Thickness = p.Thickness,
                 Gravity = p.Gravity,
+                Weight = p.Weight,
                 Compression = p.Compression,
                 Elasticity = p.Elasticity,
                 Substeps = p.Substeps,
@@ -87,6 +93,7 @@ namespace StudioModsMSG
             p.Damping = snap.Damping;
             p.Thickness = snap.Thickness;
             p.Gravity = snap.Gravity;
+            p.Weight = snap.Weight;
             p.Compression = snap.Compression;
             p.Elasticity = snap.Elasticity;
             p.Substeps = snap.Substeps;
@@ -130,6 +137,10 @@ namespace StudioModsMSG
                     logic.RefreshEntries(selection);
                 return;
             }
+
+            // ── Auto Colliders section ─────────────────────────────────────
+            DrawAutoCollidersSection(selection, host);
+            GUILayout.Space(4f);
 
             // ── Cloth list (accordion) ─────────────────────────────────────
             listScroll = GUILayout.BeginScrollView(listScroll, GUILayout.Height(ListHeight));
@@ -197,6 +208,7 @@ namespace StudioModsMSG
             DrawFloatRow(host, "Damping",   ref p.Damping,          1f,     10f);
             DrawFloatRow(host, "Thickness", ref p.Thickness,        0.002f, 0.1f);
             DrawFloatRow(host, "Gravity",      ref p.Gravity,          -30f,   0f);
+            DrawFloatRow(host, "Weight",    ref p.Weight,           0.25f,   3f);
             DrawFloatRow(host, "Compression", ref p.Compression,       0f,     1f);
             //DrawFloatRow(host, "Elasticity", ref p.Elasticity,       0f,     1f);
 
@@ -466,6 +478,110 @@ namespace StudioModsMSG
                     value = v;
             }
             GUILayout.EndHorizontal();
+        }
+
+        // ── Auto Colliders section ─────────────────────────────────────────
+
+        private Dictionary<string, ColliderMode> GetOrCreateGroupModes()
+        {
+            if (_boneGroupModes != null) return _boneGroupModes;
+
+            _boneGroupModes = new Dictionary<string, ColliderMode>(StringComparer.OrdinalIgnoreCase);
+            foreach (var grp in AutoCapsuleBuilder.BoneGroupDefs)
+            {
+                ColliderMode def = ColliderMode.Off;
+                string n = grp.Name;
+                if (n == "Torso" || n == "Arms" || n == "Legs") def = ColliderMode.Capsule;
+                else if (n == "Breasts")                         def = ColliderMode.Proxy;
+                _boneGroupModes[n] = def;
+            }
+            return _boneGroupModes;
+        }
+
+        private void DrawAutoCollidersSection(SelectionContext selection, BaseUI host)
+        {
+            // Header toggle
+            string arrow = _autoCollidersExpanded ? "▼" : "▶";
+            if (GUILayout.Button(arrow + "  Body Colliders", host.HintStyleRef, GUILayout.Height(24f)))
+                _autoCollidersExpanded = !_autoCollidersExpanded;
+
+            if (!_autoCollidersExpanded) return;
+
+            ClothSoftBodyRuntime rt = logic.GetOrCreateRuntime(selection);
+
+            // ── Source selector: only one active ──────────────────────────
+            bool isManual = rt == null || rt.CollisionSource == CollisionSourceMode.Manual;
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("Source:", host.HintStyleRef, GUILayout.Width(54f));
+            if (DrawModeButton(host, "Manual DynBone", isManual, 116f))
+            {
+                if (rt != null) rt.CollisionSource = CollisionSourceMode.Manual;
+            }
+            if (DrawModeButton(host, "Auto Generated", !isManual, 116f))
+            {
+                if (rt != null) rt.CollisionSource = CollisionSourceMode.Auto;
+            }
+            GUILayout.EndHorizontal();
+            GUILayout.Space(4f);
+
+            // Auto settings only relevant when Auto mode is selected
+            if (!isManual)
+            {
+                var modes = GetOrCreateGroupModes();
+
+                foreach (var grp in AutoCapsuleBuilder.BoneGroupDefs)
+                {
+                    ColliderMode current = modes[grp.Name];
+
+                    GUILayout.BeginHorizontal();
+                    GUILayout.Space(12f);
+                    GUILayout.Label(grp.Name, host.HintStyleRef, GUILayout.Width(68f));
+
+                    if (DrawModeButton(host, "Off",     current == ColliderMode.Off))     modes[grp.Name] = ColliderMode.Off;
+                    if (DrawModeButton(host, "Capsule", current == ColliderMode.Capsule)) modes[grp.Name] = ColliderMode.Capsule;
+                    if (DrawModeButton(host, "Proxy",   current == ColliderMode.Proxy))   modes[grp.Name] = ColliderMode.Proxy;
+
+                    GUILayout.EndHorizontal();
+                }
+
+                bool wantsProxy = false;
+                foreach (var kv in modes)
+                {
+                    if (kv.Value == ColliderMode.Proxy)
+                    {
+                        wantsProxy = true;
+                        break;
+                    }
+                }
+
+                GUILayout.Space(4f);
+
+                if (rt != null && (rt.UseAutoColliders || rt.UseProxyParticles))
+                {
+                    string stats = rt.AutoCapsuleCount + " capsules  |  " + rt.ProxyParticleCount + " proxy pts";
+                    host.DrawStatRow("Active", stats, host.SuccessColorRef);
+                }
+
+                if (rt != null && wantsProxy && rt.ProxyParticleCount <= 0)
+                    host.DrawStatRow("Proxy", "No particles generated (check group patterns / Build)", host.WarningColorRef);
+
+                GUILayout.BeginHorizontal();
+                if (GUILayout.Button("Build Auto-Colliders", GUILayout.Height(26f), GUILayout.Width(150f)))
+                    logic.RebuildColliders(selection, modes);
+                if (GUILayout.Button("Clear", GUILayout.Height(26f), GUILayout.Width(50f)))
+                {
+                    foreach (var key in new List<string>(modes.Keys))
+                        modes[key] = ColliderMode.Off;
+                    logic.RebuildColliders(selection, modes);
+                }
+                GUILayout.EndHorizontal();
+            }
+        }
+
+        private static bool DrawModeButton(BaseUI host, string label, bool active, float width = 62f)
+        {
+            string txt = active ? "[" + label + "]" : " " + label + " ";
+            return GUILayout.Button(txt, host.HintStyleRef, GUILayout.Width(width), GUILayout.Height(22f));
         }
     }
 }
