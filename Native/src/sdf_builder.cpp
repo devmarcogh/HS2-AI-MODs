@@ -134,12 +134,85 @@ SMODS_API void SDF_SkinVertices(
     }
 }
 
-// ─── Build SDF from skinned vertices ───────────────────────────
+// ─── Point-Triangle distance helper ────────────────────────────
+// Returns the squared distance from point p to triangle (a, b, c).
+// Also outputs the closest point on the triangle in 'closest'.
+static float PointTriangleDistSq(
+    float px, float py, float pz,
+    float ax, float ay, float az,
+    float bx, float by, float bz,
+    float cx, float cy, float cz,
+    float& closestX, float& closestY, float& closestZ)
+{
+    float abx = bx - ax, aby = by - ay, abz = bz - az;
+    float acx = cx - ax, acy = cy - ay, acz = cz - az;
+    float apx = px - ax, apy = py - ay, apz = pz - az;
+
+    float d1 = abx * apx + aby * apy + abz * apz;
+    float d2 = acx * apx + acy * apy + acz * apz;
+    if (d1 <= 0.0f && d2 <= 0.0f) {
+        closestX = ax; closestY = ay; closestZ = az;
+        return apx * apx + apy * apy + apz * apz;
+    }
+
+    float bpx = px - bx, bpy = py - by, bpz = pz - bz;
+    float d3 = abx * bpx + aby * bpy + abz * bpz;
+    float d4 = acx * bpx + acy * bpy + acz * bpz;
+    if (d3 >= 0.0f && d4 <= d3) {
+        closestX = bx; closestY = by; closestZ = bz;
+        return bpx * bpx + bpy * bpy + bpz * bpz;
+    }
+
+    float vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f) {
+        float v = d1 / (d1 - d3);
+        closestX = ax + abx * v; closestY = ay + aby * v; closestZ = az + abz * v;
+        float dx = px - closestX, dy = py - closestY, dz = pz - closestZ;
+        return dx * dx + dy * dy + dz * dz;
+    }
+
+    float cpx = px - cx, cpy = py - cy, cpz = pz - cz;
+    float d5 = abx * cpx + aby * cpy + abz * cpz;
+    float d6 = acx * cpx + acy * cpy + acz * cpz;
+    if (d6 >= 0.0f && d5 <= d6) {
+        closestX = cx; closestY = cy; closestZ = cz;
+        return cpx * cpx + cpy * cpy + cpz * cpz;
+    }
+
+    float vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f) {
+        float w = d2 / (d2 - d6);
+        closestX = ax + acx * w; closestY = ay + acy * w; closestZ = az + acz * w;
+        float dx = px - closestX, dy = py - closestY, dz = pz - closestZ;
+        return dx * dx + dy * dy + dz * dz;
+    }
+
+    float va = d3 * d6 - d5 * d4;
+    if (va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f) {
+        float w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        closestX = bx + (cx - bx) * w; closestY = by + (cy - by) * w; closestZ = bz + (cz - bz) * w;
+        float dx = px - closestX, dy = py - closestY, dz = pz - closestZ;
+        return dx * dx + dy * dy + dz * dz;
+    }
+
+    float denom = 1.0f / (va + vb + vc);
+    float sv = vb * denom;
+    float sw = vc * denom;
+    closestX = ax + abx * sv + acx * sw;
+    closestY = ay + aby * sv + acy * sw;
+    closestZ = az + abz * sv + acz * sw;
+    float dx = px - closestX, dy = py - closestY, dz = pz - closestZ;
+    return dx * dx + dy * dy + dz * dz;
+}
+
+// ─── Build SDF from skinned triangles ──────────────────────────
 SMODS_API void SDF_Build(
     int64_t      handle,
     const float* skinnedPos,     // [vertCount*3]
     const float* skinnedNormal,  // [vertCount*3]
     int          vertCount,
+    const int*   indices,        // [indexCount] triangle indices (can be null for vertex-only fallback)
+    int          indexCount,     // number of indices (multiple of 3)
     float        originX, float originY, float originZ,
     int          resX, int resY, int resZ,
     float        cellSize,
@@ -158,8 +231,12 @@ SMODS_API void SDF_Build(
     ctx->invCellSize = 1.0f / cellSize;
     ctx->maxDist = maxDist;
 
-    // ── Build spatial hash of skinned positions ──
-    int ts = SDFPickPrime(std::max(vertCount * 2, 251));
+    int triCount = (indices != nullptr && indexCount >= 3) ? indexCount / 3 : 0;
+    bool useTriangles = triCount > 0;
+
+    // ── Build spatial hash of triangle centroids (or vertices if no triangles) ──
+    int hashEntryCount = useTriangles ? triCount : vertCount;
+    int ts = SDFPickPrime(std::max(hashEntryCount * 2, 251));
     if (ts > ctx->hashTableCapacity) {
         delete[] ctx->hashCellCount;
         delete[] ctx->hashCellStart;
@@ -167,28 +244,42 @@ SMODS_API void SDF_Build(
         ctx->hashCellStart = new int[ts]();
         ctx->hashTableCapacity = ts;
     }
-    if (vertCount > ctx->hashCapacity) {
+    if (hashEntryCount > ctx->hashCapacity) {
         delete[] ctx->hashEntries;
         delete[] ctx->hashPerParticle;
-        ctx->hashEntries = new int[vertCount];
-        ctx->hashPerParticle = new int[vertCount];
-        ctx->hashCapacity = vertCount;
+        ctx->hashEntries = new int[hashEntryCount];
+        ctx->hashPerParticle = new int[hashEntryCount];
+        ctx->hashCapacity = hashEntryCount;
     }
     ctx->hashTableSize = ts;
-
-    // Clear
     std::memset(ctx->hashCellCount, 0, ts * sizeof(int));
 
     float invHash = 1.0f / hashCellSize;
 
-    // Pass 1: count
-    for (int i = 0; i < vertCount; i++) {
-        int ix = (int)std::floor(skinnedPos[i * 3]     * invHash);
-        int iy = (int)std::floor(skinnedPos[i * 3 + 1] * invHash);
-        int iz = (int)std::floor(skinnedPos[i * 3 + 2] * invHash);
-        int h = (int)SDF_HashCell(ix, iy, iz, ts);
-        ctx->hashPerParticle[i] = h;
-        ctx->hashCellCount[h]++;
+    if (useTriangles) {
+        // Hash triangle centroids
+        for (int t = 0; t < triCount; t++) {
+            int i0 = indices[t * 3], i1 = indices[t * 3 + 1], i2 = indices[t * 3 + 2];
+            float cx = (skinnedPos[i0 * 3] + skinnedPos[i1 * 3] + skinnedPos[i2 * 3]) / 3.0f;
+            float cy = (skinnedPos[i0 * 3 + 1] + skinnedPos[i1 * 3 + 1] + skinnedPos[i2 * 3 + 1]) / 3.0f;
+            float cz = (skinnedPos[i0 * 3 + 2] + skinnedPos[i1 * 3 + 2] + skinnedPos[i2 * 3 + 2]) / 3.0f;
+            int hx = (int)std::floor(cx * invHash);
+            int hy = (int)std::floor(cy * invHash);
+            int hz = (int)std::floor(cz * invHash);
+            int h = (int)SDF_HashCell(hx, hy, hz, ts);
+            ctx->hashPerParticle[t] = h;
+            ctx->hashCellCount[h]++;
+        }
+    } else {
+        // Hash vertices (legacy fallback)
+        for (int i = 0; i < vertCount; i++) {
+            int ix = (int)std::floor(skinnedPos[i * 3]     * invHash);
+            int iy = (int)std::floor(skinnedPos[i * 3 + 1] * invHash);
+            int iz = (int)std::floor(skinnedPos[i * 3 + 2] * invHash);
+            int h = (int)SDF_HashCell(ix, iy, iz, ts);
+            ctx->hashPerParticle[i] = h;
+            ctx->hashCellCount[h]++;
+        }
     }
 
     // Prefix sum
@@ -199,14 +290,14 @@ SMODS_API void SDF_Build(
         ctx->hashCellCount[c] = 0;
     }
 
-    // Pass 2: scatter
-    for (int i = 0; i < vertCount; i++) {
+    // Scatter
+    for (int i = 0; i < hashEntryCount; i++) {
         int h = ctx->hashPerParticle[i];
         ctx->hashEntries[ctx->hashCellStart[h] + ctx->hashCellCount[h]] = i;
         ctx->hashCellCount[h]++;
     }
 
-    // ── Build SDF: for each voxel find closest vertex ──
+    // ── Build SDF ──
     int total = resX * resY * resZ;
     int rxy = resX * resY;
 
@@ -220,7 +311,6 @@ SMODS_API void SDF_Build(
         float wpy = originY + vy * cellSize;
         float wpz = originZ + vz * cellSize;
 
-        // Query spatial hash neighbourhood
         int minIx = (int)std::floor((wpx - queryRadius) * invHash);
         int maxIx = (int)std::floor((wpx + queryRadius) * invHash);
         int minIy = (int)std::floor((wpy - queryRadius) * invHash);
@@ -228,64 +318,120 @@ SMODS_API void SDF_Build(
         int minIz = (int)std::floor((wpz - queryRadius) * invHash);
         int maxIz = (int)std::floor((wpz + queryRadius) * invHash);
 
-        // ── K-nearest for sign voting (matches GPU kernel) ──
-        static const int K_NEAREST = 4;
-        float kDistSq[K_NEAREST];
-        int   kIdx[K_NEAREST];
-        for (int k = 0; k < K_NEAREST; k++) { kDistSq[k] = 1e30f; kIdx[k] = -1; }
+        float bestDistSq = 1e30f;
+        float bestClosestX = 0, bestClosestY = 0, bestClosestZ = 0;
+        float bestNX = 0, bestNY = 1, bestNZ = 0; // fallback normal
 
-        for (int ix = minIx; ix <= maxIx; ix++) {
-            for (int iy = minIy; iy <= maxIy; iy++) {
-                for (int iz = minIz; iz <= maxIz; iz++) {
-                    int h = (int)SDF_HashCell(ix, iy, iz, ts);
-                    int start = ctx->hashCellStart[h];
-                    int count = ctx->hashCellCount[h];
-                    for (int k = 0; k < count; k++) {
-                        int pidx = ctx->hashEntries[start + k];
-                        float dx = wpx - skinnedPos[pidx * 3];
-                        float dy = wpy - skinnedPos[pidx * 3 + 1];
-                        float dz = wpz - skinnedPos[pidx * 3 + 2];
-                        float dSq = dx * dx + dy * dy + dz * dz;
-                        // Insert into K-nearest if closer than farthest
-                        if (dSq < kDistSq[K_NEAREST - 1]) {
-                            kDistSq[K_NEAREST - 1] = dSq;
-                            kIdx[K_NEAREST - 1] = pidx;
-                            // Bubble sort towards front
-                            for (int s = K_NEAREST - 1; s > 0; s--) {
-                                if (kDistSq[s] < kDistSq[s - 1]) {
-                                    std::swap(kDistSq[s], kDistSq[s - 1]);
-                                    std::swap(kIdx[s], kIdx[s - 1]);
+        if (useTriangles) {
+            // Triangle-based: find closest triangle
+            for (int ix = minIx; ix <= maxIx; ix++) {
+                for (int iy = minIy; iy <= maxIy; iy++) {
+                    for (int iz = minIz; iz <= maxIz; iz++) {
+                        int h = (int)SDF_HashCell(ix, iy, iz, ts);
+                        int start = ctx->hashCellStart[h];
+                        int count = ctx->hashCellCount[h];
+                        for (int k = 0; k < count; k++) {
+                            int triIdx = ctx->hashEntries[start + k];
+                            int i0 = indices[triIdx * 3];
+                            int i1 = indices[triIdx * 3 + 1];
+                            int i2 = indices[triIdx * 3 + 2];
+
+                            float closX, closY, closZ;
+                            float dSq = PointTriangleDistSq(
+                                wpx, wpy, wpz,
+                                skinnedPos[i0 * 3], skinnedPos[i0 * 3 + 1], skinnedPos[i0 * 3 + 2],
+                                skinnedPos[i1 * 3], skinnedPos[i1 * 3 + 1], skinnedPos[i1 * 3 + 2],
+                                skinnedPos[i2 * 3], skinnedPos[i2 * 3 + 1], skinnedPos[i2 * 3 + 2],
+                                closX, closY, closZ);
+
+                            if (dSq < bestDistSq) {
+                                bestDistSq = dSq;
+                                bestClosestX = closX;
+                                bestClosestY = closY;
+                                bestClosestZ = closZ;
+                                // Compute triangle face normal for sign
+                                float e1x = skinnedPos[i1 * 3]     - skinnedPos[i0 * 3];
+                                float e1y = skinnedPos[i1 * 3 + 1] - skinnedPos[i0 * 3 + 1];
+                                float e1z = skinnedPos[i1 * 3 + 2] - skinnedPos[i0 * 3 + 2];
+                                float e2x = skinnedPos[i2 * 3]     - skinnedPos[i0 * 3];
+                                float e2y = skinnedPos[i2 * 3 + 1] - skinnedPos[i0 * 3 + 1];
+                                float e2z = skinnedPos[i2 * 3 + 2] - skinnedPos[i0 * 3 + 2];
+                                bestNX = e1y * e2z - e1z * e2y;
+                                bestNY = e1z * e2x - e1x * e2z;
+                                bestNZ = e1x * e2y - e1y * e2x;
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            // Vertex-based fallback (legacy K-nearest)
+            static const int K_NEAREST = 4;
+            float kDistSq[K_NEAREST];
+            int   kIdx[K_NEAREST];
+            for (int k = 0; k < K_NEAREST; k++) { kDistSq[k] = 1e30f; kIdx[k] = -1; }
+
+            for (int ix = minIx; ix <= maxIx; ix++) {
+                for (int iy = minIy; iy <= maxIy; iy++) {
+                    for (int iz = minIz; iz <= maxIz; iz++) {
+                        int h = (int)SDF_HashCell(ix, iy, iz, ts);
+                        int start = ctx->hashCellStart[h];
+                        int count = ctx->hashCellCount[h];
+                        for (int k = 0; k < count; k++) {
+                            int pidx = ctx->hashEntries[start + k];
+                            float ddx = wpx - skinnedPos[pidx * 3];
+                            float ddy = wpy - skinnedPos[pidx * 3 + 1];
+                            float ddz = wpz - skinnedPos[pidx * 3 + 2];
+                            float dSq = ddx * ddx + ddy * ddy + ddz * ddz;
+                            if (dSq < kDistSq[K_NEAREST - 1]) {
+                                kDistSq[K_NEAREST - 1] = dSq;
+                                kIdx[K_NEAREST - 1] = pidx;
+                                for (int ss = K_NEAREST - 1; ss > 0; ss--) {
+                                    if (kDistSq[ss] < kDistSq[ss - 1]) {
+                                        std::swap(kDistSq[ss], kDistSq[ss - 1]);
+                                        std::swap(kIdx[ss], kIdx[ss - 1]);
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
+
+            if (kIdx[0] >= 0) {
+                bestDistSq = kDistSq[0];
+                // Weighted sign voting
+                float signAccum = 0.0f;
+                float epsilon = kDistSq[0] * 0.01f + 1e-10f;
+                for (int nn = 0; nn < K_NEAREST; nn++) {
+                    if (kIdx[nn] < 0) break;
+                    float tvx = wpx - skinnedPos[kIdx[nn] * 3];
+                    float tvy = wpy - skinnedPos[kIdx[nn] * 3 + 1];
+                    float tvz = wpz - skinnedPos[kIdx[nn] * 3 + 2];
+                    float vote = tvx * skinnedNormal[kIdx[nn] * 3]
+                               + tvy * skinnedNormal[kIdx[nn] * 3 + 1]
+                               + tvz * skinnedNormal[kIdx[nn] * 3 + 2];
+                    float ww = 1.0f / (kDistSq[nn] + epsilon);
+                    signAccum += vote * ww;
+                }
+                outSDF[vi] = (signAccum >= 0.0f) ? std::sqrt(bestDistSq) : -std::sqrt(bestDistSq);
+                continue; // skip to next voxel (sign already computed)
+            }
         }
 
-        if (kIdx[0] < 0) {
+        if (bestDistSq >= 1e29f) {
             outSDF[vi] = maxDist;
             continue;
         }
 
-        float dist = std::sqrt(kDistSq[0]);
+        float dist = std::sqrt(bestDistSq);
 
-        // Distance-weighted sign voting from K nearest vertices
-        float signAccum = 0.0f;
-        float epsilon = kDistSq[0] * 0.01f + 1e-10f;
-        for (int n = 0; n < K_NEAREST; n++) {
-            if (kIdx[n] < 0) break;
-            float toVoxelX = wpx - skinnedPos[kIdx[n] * 3];
-            float toVoxelY = wpy - skinnedPos[kIdx[n] * 3 + 1];
-            float toVoxelZ = wpz - skinnedPos[kIdx[n] * 3 + 2];
-            float vote = toVoxelX * skinnedNormal[kIdx[n] * 3]
-                       + toVoxelY * skinnedNormal[kIdx[n] * 3 + 1]
-                       + toVoxelZ * skinnedNormal[kIdx[n] * 3 + 2];
-            float weight = 1.0f / (kDistSq[n] + epsilon);
-            signAccum += vote * weight;
-        }
-
-        outSDF[vi] = (signAccum >= 0.0f) ? dist : -dist;
+        // Sign: dot(voxel - closestPoint, faceNormal)
+        float toVoxX = wpx - bestClosestX;
+        float toVoxY = wpy - bestClosestY;
+        float toVoxZ = wpz - bestClosestZ;
+        float signDot = toVoxX * bestNX + toVoxY * bestNY + toVoxZ * bestNZ;
+        outSDF[vi] = (signDot >= 0.0f) ? dist : -dist;
     }
 
     // ── Smoothing pass (3×3×3 Gaussian blur, in-place via temp buffer) ──

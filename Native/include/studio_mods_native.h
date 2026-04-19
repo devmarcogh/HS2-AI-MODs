@@ -174,10 +174,12 @@ SMODS_API void SDF_SkinVertices(
     const float* boneMats, int count,
     float* outPos, float* outNormal);
 
-/// Build SDF volume from skinned vertices. Includes spatial hash build internally.
+/// Build SDF volume from skinned vertices + triangle topology.
+/// Triangle-based distance gives continuous fields without vertex-gap artefacts.
 SMODS_API void SDF_Build(
     int64_t handle,
     const float* skinnedPos, const float* skinnedNormal, int vertCount,
+    const int* indices, int indexCount,
     float originX, float originY, float originZ,
     int resX, int resY, int resZ,
     float cellSize, float maxDist,
@@ -200,3 +202,46 @@ SMODS_API void SDF_CollideVertices(
     float originX, float originY, float originZ,
     float invCellSize, float maxDist,
     float thickness);
+
+// ─── VBD Cloth Solver ───────────────────────────────────────────────
+
+/// Create a VBD (Vertex Block Descent) cloth context.
+/// Stores topology + rest state internally. Returns opaque handle.
+SMODS_API int64_t Cloth_CreateVBD(
+    int vertCount,
+    const float* pos,
+    const float* invMass,
+    int edgeCount,
+    const int* edgeIndices,
+    const float* restLen,
+    int bendCount,
+    const int* bendIndices,
+    const float* restBendLen);
+
+/// Execute a full VBD step (substeps × iterations) entirely in C++.
+/// pos and vel are read/written in-place.
+SMODS_API void Cloth_StepVBD(
+    int64_t handle,
+    float* pos,
+    float* vel,
+    const NativeCollider* colliders, int colCount,
+    const float* sdfData,
+    int sdfResX, int sdfResY, int sdfResZ,
+    float sdfOriginX, float sdfOriginY, float sdfOriginZ,
+    float sdfInvCellSize, float sdfMaxDist, float sdfThickness,
+    float dt,
+    int substeps,
+    int iterations,
+    float gravity,
+    float stretchStiffness,
+    float bendStiffness,
+    float damping,
+    float friction,
+    float thickness,
+    float maxSpeed,
+    float compression,
+    const float* invMass
+);
+
+/// Destroy a VBD cloth context.
+SMODS_API void Cloth_DestroyVBD(int64_t handle);
