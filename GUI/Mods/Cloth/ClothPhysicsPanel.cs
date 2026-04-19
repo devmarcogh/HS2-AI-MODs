@@ -449,10 +449,10 @@ namespace StudioModsMSG
             // ── Physics parameters ────────────────────────────────────────
             ClothPhysicsParams p = selectedMesh.Params;
 
-            DrawFloatRow(host, "Stretch",     ref p.StretchStiffness, 0f,     10000f);
+            DrawFloatRow(host, "Stretch",     ref p.StretchStiffness, 0f,     100f);
             DrawFloatRow(host, "Bending",     ref p.BendStiffness,    0f,       50f);
             DrawFloatRow(host, "Damping",     ref p.Damping,          0.5f,     20f);
-            DrawFloatRow(host, "Thickness",   ref p.Thickness,        0.001f,   0.2f);
+            DrawFloatRow(host, "Thickness",   ref p.Thickness,        0.001f,   0.4f);
             DrawFloatRow(host, "Rest Inflate", ref p.RestInflate,     0f,       0.04f);
             DrawFloatRow(host, "Gravity",     ref p.Gravity,         -30f,      0f);
             DrawFloatRow(host, "Weight",      ref p.Weight,           0.1f,     3f);

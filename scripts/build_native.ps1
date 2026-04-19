@@ -1,4 +1,4 @@
-<# 
+﻿<# 
     Build script for StudioModsNative.dll (C++ SIMD PBD solver)
     Requires: CMake 3.15+, Visual Studio 2019+ with C++ Desktop workload
     
@@ -24,7 +24,7 @@ if (!(Test-Path $buildDir)) {
 
 Push-Location $buildDir
 try {
-    # Configure — auto-detect VS version
+    # Configure â€” auto-detect VS version
     Write-Host "Configuring with CMake..." -ForegroundColor Yellow
     
     $generators = @(
@@ -46,7 +46,7 @@ try {
         Remove-Item CMakeCache.txt -ErrorAction SilentlyContinue
         Remove-Item CMakeFiles -Recurse -Force -ErrorAction SilentlyContinue
     }
-    if (-not $configured) { throw "CMake configure failed — no supported Visual Studio found" }
+    if (-not $configured) { throw "CMake configure failed â€” no supported Visual Studio found" }
 
     # Build
     Write-Host "Building..." -ForegroundColor Yellow

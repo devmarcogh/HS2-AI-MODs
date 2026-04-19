@@ -286,6 +286,7 @@ namespace StudioModsMSG
         public static extern void SDF_Build(
             long handle,
             [In] float[] skinnedPos, [In] float[] skinnedNormal, int vertCount,
+            [In] int[] indices, int indexCount,
             float originX, float originY, float originZ,
             int resX, int resY, int resZ,
             float cellSize, float maxDist,
@@ -308,6 +309,47 @@ namespace StudioModsMSG
             float originX, float originY, float originZ,
             float invCellSize, float maxDist,
             float thickness);
+
+        // ── VBD Cloth Solver ────────────────────────────────────
+
+        [DllImport(DLL, CallingConvention = CallingConvention.Cdecl)]
+        public static extern long Cloth_CreateVBD(
+            int vertCount,
+            [In] float[] pos,
+            [In] float[] invMass,
+            int edgeCount,
+            [In] int[] edgeIndices,
+            [In] float[] restLen,
+            int bendCount,
+            [In] int[] bendIndices,
+            [In] float[] restBendLen);
+
+        [DllImport(DLL, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void Cloth_StepVBD(
+            long handle,
+            [In, Out] float[] pos,
+            [In, Out] float[] vel,
+            [In] NativeCollider[] colliders,
+            int colCount,
+            [In] float[] sdfData,
+            int sdfResX, int sdfResY, int sdfResZ,
+            float sdfOriginX, float sdfOriginY, float sdfOriginZ,
+            float sdfInvCellSize, float sdfMaxDist, float sdfThickness,
+            float dt,
+            int substeps,
+            int iterations,
+            float gravity,
+            float stretchStiffness,
+            float bendStiffness,
+            float damping,
+            float friction,
+            float thickness,
+            float maxSpeed,
+            float compression,
+            [In] float[] invMass);
+
+        [DllImport(DLL, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void Cloth_DestroyVBD(long handle);
 
         // ── Managed helpers for bool[] -> int[] ─────────────────
 

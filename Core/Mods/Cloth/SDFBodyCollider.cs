@@ -58,6 +58,10 @@ namespace StudioModsMSG
         private float4x4[]  _boneMatrices;  // world-space skinning matrices
         private Transform[] _bones;
         private Matrix4x4[] _bindPoses;
+
+        // ── Triangle topology (for triangle-based SDF) ──────────────────
+        private int[]       _triangleIndices;   // remapped triangle indices into decimated vertex set
+        private int[]       _nTriangleIndices;  // flat copy for native call
         private int         _vertCount;
 
         // ── Per-frame skinned output ────────────────────────────────────
@@ -123,6 +127,8 @@ namespace StudioModsMSG
         public int   SDFResZ      => _resZ;
         public float SDFCellSize  => _cellSizeActual;
         public float SDFMaxDist   => _maxDist;
+        public float SDFInvCellSize => _invCellSize;
+        public float[] SDFData    => _sdfData;
 
         /// <summary>
         /// Returns the GPU SDF buffer if the GPU path is active, otherwise null.
@@ -214,13 +220,35 @@ namespace StudioModsMSG
                 }
             }
 
-            // ── 4. Pre-allocate SDF at max size ──
+            // ── 4. Build remapped triangle indices ──
+            // Map original mesh vertex indices → decimated index set
+            var originalToDecimated = new Dictionary<int, int>(_vertCount);
+            for (int j = 0; j < _vertCount; j++)
+                originalToDecimated[included[j]] = j;
+
+            int[] origTris = mesh.triangles;
+            var remappedTris = new List<int>(origTris.Length);
+            for (int t = 0; t < origTris.Length; t += 3)
+            {
+                int a, b, c;
+                if (originalToDecimated.TryGetValue(origTris[t], out a) &&
+                    originalToDecimated.TryGetValue(origTris[t + 1], out b) &&
+                    originalToDecimated.TryGetValue(origTris[t + 2], out c))
+                {
+                    remappedTris.Add(a);
+                    remappedTris.Add(b);
+                    remappedTris.Add(c);
+                }
+            }
+            _triangleIndices = remappedTris.ToArray();
+
+            // ── 5. Pre-allocate SDF at max size ──
             int maxVox = resolution * resolution * resolution;
             _sdfData     = new float[maxVox];
             _totalVoxels = 0;
             _frameCounter = 0;
 
-            // ── 5. Pre-allocate native flat arrays ──
+            // ── 6. Pre-allocate native flat arrays ──
             if (NativeAvailable)
             {
                 _nBindPos     = new float[_vertCount * 3];
@@ -229,6 +257,7 @@ namespace StudioModsMSG
                 _nBoneW       = new float[_vertCount * 4];
                 _nSkinnedPos  = new float[_vertCount * 3];
                 _nSkinnedNormal = new float[_vertCount * 3];
+                _nTriangleIndices = _triangleIndices; // already int[], share reference
                 for (int j = 0; j < _vertCount; j++)
                 {
                     _nBindPos[j * 3]     = _bindLocal[j].x;
@@ -356,6 +385,7 @@ namespace StudioModsMSG
                 NativeBridge.SDF_Build(
                     _nativeSDFHandle,
                     _nSkinnedPos, _nSkinnedNormal, _vertCount,
+                    _nTriangleIndices, _nTriangleIndices != null ? _nTriangleIndices.Length : 0,
                     _origin.x, _origin.y, _origin.z,
                     _resX, _resY, _resZ,
                     _cellSizeActual, _maxDist,

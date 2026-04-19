@@ -19,7 +19,7 @@ namespace StudioModsMSG
     ///      mirrored DynamicBone collider collision).
     ///   4. Derive velocity from position change, apply damping, commit positions.
     /// </summary>
-    [DefaultExecutionOrder(10000)] // Run after IK/FK mods so bone transforms are final
+    [DefaultExecutionOrder(99999)] // Run after IK/FK mods so bone transforms are final
     class ClothSoftBodyRuntime : MonoBehaviour
     {
 
@@ -147,6 +147,20 @@ namespace StudioModsMSG
                 s.PredPosition[i] = new Vector3(_nPred[i3], _nPred[i3 + 1], _nPred[i3 + 2]);
             }
         }
+        // VBD no produce un buffer pred separado — pos ya es el resultado final committed.
+        // Leer _nPred aquí daría datos del frame anterior o basura.
+        private void SyncFromNativeVBD(ClothMeshState s)
+        {
+            int n = s.VertCount;
+            for (int i = 0; i < n; i++)
+            {
+                int i3 = i * 3;
+                s.Position[i]     = new Vector3(_nPos[i3], _nPos[i3 + 1], _nPos[i3 + 2]);
+                s.Velocity[i]     = new Vector3(_nVel[i3], _nVel[i3 + 1], _nVel[i3 + 2]);
+                s.PredPosition[i] = s.Position[i]; // VBD commitea pos directamente; pred = pos
+            }
+        }
+
 
         private void BuildNativeColliders()
         {
@@ -377,12 +391,16 @@ namespace StudioModsMSG
             if (GPUClothAvailable)
                 _gpuClothSolver.UploadTopology(state);
 
+            // Create native VBD context with full topology
+            CreateVBDHandle(state);
+
             WarmUpClothState(state);
         }
 
         public void DeactivateMesh(ClothMeshState state)
         {
             if (state == null || !state.IsActive) return;
+            DestroyVBDHandle(state);
             TeardownMeshState(state);
             state.IsActive = false;
             activeStates.Remove(state);
@@ -486,8 +504,10 @@ namespace StudioModsMSG
         private void OnDisable()
         {
             // Deactivate all on component disable
-            for (int i = activeStates.Count - 1; i >= 0; i--)
+            for (int i = activeStates.Count - 1; i >= 0; i--){
                 DeactivateMesh(activeStates[i]);
+            }
+            // Release VBD handle if still alive
 
             // Release GPU cloth solver
             _gpuClothSolver?.Dispose();
@@ -541,6 +561,9 @@ namespace StudioModsMSG
                 if (state.SimulationMode == ClothSimulationMode.ManualDeformation)
                     UpdateManualDeformMasks(state);
 
+                // Follow mesh-object transform changes such as FK or reparenting.
+                ApplyRendererTransformFollow(state);
+
                 // LBS skinning + per-vertex bone-follow using per-mesh cached buffers.
                 SkinAndFollowBones(state);
 
@@ -548,10 +571,14 @@ namespace StudioModsMSG
                 int   substeps = Mathf.Max(1, Mathf.RoundToInt(state.Params.Substeps));
                 float subDt    = dt / substeps;
 
-                // 3-tier fallback: GPU → Native → Managed
+                // 3-tier fallback: GPU → Native VBD → Native xPBD → Managed
                 if (GPUClothAvailable)
                 {
                     SimulateAllSubstepsGPU(state, dt, substeps);
+                }
+                else if (state.VBDHandle != 0 && NativeAvailable)
+                {
+                    SimulateStepVBD(state, dt, substeps);
                 }
                 else
                 {
@@ -1029,8 +1056,101 @@ namespace StudioModsMSG
             SyncFromNative(s);
         }
 
-        /// <summary>
-        /// Pure function: resolve collisions and magnetic interactions for a single vertex.
+        // ================================================================== //
+        // VBD handle lifecycle
+        // ================================================================== //
+        private void CreateVBDHandle(ClothMeshState state)
+        {
+            if (!NativeAvailable || state == null) return;
+            DestroyVBDHandle(state); // clean up any previous handle
+
+            int edgeCount = (state.Edges != null) ? state.Edges.Length / 2 : 0;
+            int bendCount = (state.BendPairs != null) ? state.BendPairs.Length / 2 : 0;
+            int n = state.VertCount;
+
+            // Flatten positions to flat float array for the native call
+            float[] posFlat = new float[n * 3];
+            for (int i = 0; i < n; i++)
+            {
+                posFlat[i * 3]     = state.Position[i].x;
+                posFlat[i * 3 + 1] = state.Position[i].y;
+                posFlat[i * 3 + 2] = state.Position[i].z;
+            }
+
+            state.VBDHandle = NativeBridge.Cloth_CreateVBD(
+                n, posFlat, state.InvMass,
+                edgeCount, state.Edges ?? new int[0], state.RestEdgeLen ?? new float[0],
+                bendCount, state.BendPairs ?? new int[0], state.RestBendLen ?? new float[0]);
+        }
+
+        private void DestroyVBDHandle(ClothMeshState state)
+        {
+            if (state.VBDHandle != 0)
+            {
+                NativeBridge.Cloth_DestroyVBD(state.VBDHandle);
+                state.VBDHandle = 0;
+            }
+        }
+
+        // ================================================================== //
+        // Native VBD — single call handles all substeps, iterations, collision
+        // ================================================================== //
+        private void SimulateStepVBD(ClothMeshState s, float dt, int substeps)
+        {
+            int n = s.VertCount;
+
+            Array.Copy(s.Position, s.PrevPosition, n);
+
+            EnsureNativeBuffers(s);
+            SyncToNative(s);
+
+            // Build capsule/sphere colliders for native
+            BuildNativeColliders();
+
+            // SDF state
+            bool useSDF = UseSDFColliders && _sdfProxy != null && _sdfProxy.IsReady;
+            float[] sdfData = useSDF ? _sdfProxy.SDFData : null;
+            int sdfResX = useSDF ? _sdfProxy.SDFResX : 0;
+            int sdfResY = useSDF ? _sdfProxy.SDFResY : 0;
+            int sdfResZ = useSDF ? _sdfProxy.SDFResZ : 0;
+            float sdfOriginX = useSDF ? _sdfProxy.SDFOriginX : 0f;
+            float sdfOriginY = useSDF ? _sdfProxy.SDFOriginY : 0f;
+            float sdfOriginZ = useSDF ? _sdfProxy.SDFOriginZ : 0f;
+            float sdfInvCell = useSDF ? _sdfProxy.SDFInvCellSize : 0f;
+            float sdfMaxDist = useSDF ? _sdfProxy.SDFMaxDist : 0f;
+            float sdfThick   = s.Params.Thickness;
+
+            // Physics params
+            int iterations = Mathf.Max(1, Mathf.RoundToInt(s.Params.Iterations));
+            float gravity = s.Params.Gravity * s.Params.Weight;
+            float stretchStiffness = s.Params.StretchStiffness;
+            float bendStiffness    = s.Params.BendStiffness;
+
+            float dampBase = s.Params.Damping;
+            if (s.WarmupFramesRemaining > 0)
+                dampBase = Mathf.Lerp(dampBase, 30f,
+                    s.WarmupFramesRemaining / (float)ClothMeshState.WarmupDuration);
+            float maxSpeed = s.WarmupFramesRemaining > 0 ? 2f : 15f;
+            float friction = 0.3f;
+            float thick = s.Params.Thickness;
+            float compression = s.Params.Compression; // El C++ calcula pressScale internamente
+
+            // Single native call: all substeps × iterations × collision
+            NativeBridge.Cloth_StepVBD(
+                s.VBDHandle,
+                _nPos, _nVel,
+                _nColliders, _mirrorColCount,
+                sdfData, sdfResX, sdfResY, sdfResZ,
+                sdfOriginX, sdfOriginY, sdfOriginZ,
+                sdfInvCell, sdfMaxDist, sdfThick,
+                dt, substeps, iterations,
+                gravity, stretchStiffness, bendStiffness,
+                dampBase, friction, thick, maxSpeed, compression,
+                s.InvMass);
+
+            // Sync back to managed arrays
+            SyncFromNativeVBD(s);
+        }
         /// Thread-safe — no shared mutable state.
         /// MagneticMode: 0=Repel (normal push-out), 1=Attract (pull toward surface), 2=Off.
         /// </summary>
@@ -1333,6 +1453,48 @@ namespace StudioModsMSG
                 s.ClothCollider.sharedMesh = null;
                 s.ClothCollider.sharedMesh = s.WorkMesh;
             }
+        }
+        private static void ApplyRendererTransformFollow(ClothMeshState s)
+        {
+            if (s == null || s.Renderer == null) return;
+
+            Matrix4x4 current = s.Renderer.transform.localToWorldMatrix;
+            if (!s.HasPrevRendererTransform)
+            {
+                s.PrevRendererLocalToWorld = current;
+                s.HasPrevRendererTransform = true;
+                return;
+            }
+
+            Matrix4x4 previous = s.PrevRendererLocalToWorld;
+            bool changed = false;
+            for (int i = 0; i < 16; i++)
+            {
+                if (Mathf.Abs(current[i] - previous[i]) > 1e-6f)
+                {
+                    changed = true;
+                    break;
+                }
+            }
+            if (!changed) return;
+
+            Matrix4x4 delta = current * previous.inverse;
+            for (int i = 0; i < s.VertCount; i++)
+            {
+                s.Position[i] = delta.MultiplyPoint3x4(s.Position[i]);
+
+                if (s.PrevPosition != null && i < s.PrevPosition.Length)
+                    s.PrevPosition[i] = delta.MultiplyPoint3x4(s.PrevPosition[i]);
+                if (s.PredPosition != null && i < s.PredPosition.Length)
+                    s.PredPosition[i] = delta.MultiplyPoint3x4(s.PredPosition[i]);
+                if (s.SkinnedPositions != null && i < s.SkinnedPositions.Length)
+                    s.SkinnedPositions[i] = delta.MultiplyPoint3x4(s.SkinnedPositions[i]);
+                if (s.PrevSkinnedPositions != null && i < s.PrevSkinnedPositions.Length)
+                    s.PrevSkinnedPositions[i] = delta.MultiplyPoint3x4(s.PrevSkinnedPositions[i]);
+            }
+
+            s.PrevRendererLocalToWorld = current;
+            UpdateWorldBounds(s);
         }
 
         /// <summary>
@@ -1845,6 +2007,8 @@ namespace StudioModsMSG
             state.ClothCollider.enabled = true;
 
             state.LocalVerts = new Vector3[state.VertCount];
+            state.PrevRendererLocalToWorld = smr.transform.localToWorldMatrix;
+            state.HasPrevRendererTransform = true;
             // Initial pin positions will be set by SkinPinnedVertices on next frame
             UpdateWorldBounds(state);
             return true;
@@ -1868,6 +2032,8 @@ namespace StudioModsMSG
             state.ClothCollider = null;
             state.Filter   = null;
             state.WorkMesh = null;
+            state.PrevRendererLocalToWorld = Matrix4x4.identity;
+            state.HasPrevRendererTransform = false;
         }
         private static int[] WeldVertices(Vector3[] positions, int[] triangles, float threshold)
         {

@@ -139,9 +139,14 @@ namespace StudioModsMSG
         public Material[]   OriginalMaterials;  // saved from SMR on disable
         public Vector3[]    LocalVerts;         // cached buffer for WriteMesh (no GC per frame)
         public Vector3[]    RestBodyLocalPos;   // rest positions in chaCtrl local space (Compression + pinning)
+        public Matrix4x4    PrevRendererLocalToWorld = Matrix4x4.identity;
+        public bool         HasPrevRendererTransform = false;
 
         // -- Broadphase --
         public Bounds WorldBounds;
+
+        public long VBDHandle = 0;
+
     }
 
     // -----------------------------------------------------------------------
