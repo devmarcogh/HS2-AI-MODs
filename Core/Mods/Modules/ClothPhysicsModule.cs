@@ -67,6 +67,12 @@ namespace StudioModsMSG
             rt?.RefreshEntries();
         }
 
+        public void DisableAllSimulation(SelectionContext selection, bool clearSdfCollider = false)
+        {
+            ClothSoftBodyRuntime rt = GetOrCreateRuntime(selection);
+            rt?.DisableAllSimulation(clearSdfCollider);
+        }
+
         public void RecomputePins(SelectionContext selection, ClothMeshState state)
         {
             ClothSoftBodyRuntime rt = GetOrCreateRuntime(selection);
@@ -74,13 +80,12 @@ namespace StudioModsMSG
         }
 
         /// <summary>
-        /// Builds auto-capsule and proxy-particle colliders for the character
-        /// based on the per-group bone modes chosen in the GUI.
+        /// Builds SDF collider for the character based on enabled body groups.
         /// </summary>
-        public void RebuildColliders(SelectionContext selection, Dictionary<string, ColliderMode> boneGroupModes)
+        public void RebuildSDFCollider(SelectionContext selection, Dictionary<string, bool> sdfGroupEnabled)
         {
             ClothSoftBodyRuntime rt = GetOrCreateRuntime(selection);
-            rt?.BuildAutoColliders(boneGroupModes);
+            rt?.BuildSDFCollider(sdfGroupEnabled);
         }
     }
 }

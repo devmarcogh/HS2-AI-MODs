@@ -4,8 +4,6 @@ using System;
 using System.Collections.Generic;
 using UnityEngine;
 using PushUpAI;
-using HS2_BoobSettings;
-using KKABMX.Core;
 using KoiSkinOverlayX;
 using KoiClothesOverlayX;
 using MessagePack;
@@ -187,25 +185,8 @@ namespace StudioModsMSG
                 return PushUpController != null;
             } 
         }
-        public object BoobController { get; private set; }
-        public bool HasBoobSettingPlugin
-        {
-            get
-            {
-                return BoobController != null;
-            }
-        }
-        public object BoneController { get; private set; }
-        public bool HasABMXPlugin
-        {
-            get
-            {
-                return BoneController != null;
-            }
-        }
         public object SkinOverlayContrller { get; private set; }
         public object ClothOverlayContrller { get; private set; }
-        public object BreastSoftBodyController { get; private set; }
         public bool HasOverlayPlugin
         {
             get
@@ -213,13 +194,8 @@ namespace StudioModsMSG
                 return SkinOverlayContrller != null && ClothOverlayContrller != null;
             }
         }
-        public bool HasBreastSoftBody
-        {
-            get
-            {
-                return BreastSoftBodyController != null;
-            }
-        }
+
+
 
         public CharaEditorController(OCIChar target)
         {
@@ -239,22 +215,6 @@ namespace StudioModsMSG
             }
             try
             {
-                InitBoobCtrl();
-            }
-            catch (Exception)
-            {
-                BoobController = null;
-            }
-            try
-            {
-                InitABMXCtrl();
-            }
-            catch (Exception)
-            {
-                BoneController = null;
-            }
-            try
-            {
                 InitOverlayCtrl();
             }
             catch (Exception)
@@ -262,14 +222,7 @@ namespace StudioModsMSG
                 SkinOverlayContrller = null;
                 ClothOverlayContrller = null;
             }
-            try
-            {
-                InitBreastSoftBodyCtrl();
-            }
-            catch (Exception)
-            {
-                BreastSoftBodyController = null;
-            }
+
 
             InitFileData();
             CheckHairColor();
@@ -296,21 +249,6 @@ namespace StudioModsMSG
         }
         #endregion
 
-        #region BoobSettingPlugin
-        private void InitBoobCtrl()
-        {
-            BoobController = ociTarget.charInfo.GetComponent<BoobController>();
-        }
-        #endregion
-
-        #region ABMXPlugin
-        private void InitABMXCtrl()
-        {
-            GameObject gameObject = ociTarget.charInfo.gameObject;
-            BoneController = ((gameObject != null) ? gameObject.GetComponent<BoneController>() : null);
-        }
-        #endregion
-
         #region OverlayPlugin
         private void InitOverlayCtrl()
         {
@@ -320,25 +258,7 @@ namespace StudioModsMSG
         }
         #endregion
 
-        #region BreastSoftBody
-        private void InitBreastSoftBodyCtrl()
-        {
-            GameObject gameObject = ociTarget.charInfo.gameObject;
-            if (gameObject == null)
-            {
-                BreastSoftBodyController = null;
-                return;
-            }
 
-            BreastSoftBodyRuntime runtime = gameObject.GetComponent<BreastSoftBodyRuntime>();
-            if (runtime == null)
-            {
-                runtime = gameObject.AddComponent<BreastSoftBodyRuntime>();
-            }
-            runtime.Attach(ociTarget.charInfo);
-            BreastSoftBodyController = runtime;
-        }
-        #endregion
 
         public void InitTexture(bool init)
         {
@@ -499,28 +419,6 @@ namespace StudioModsMSG
                 }
             }
             */
-
-            // Boob Setting detail set
-            if (HasBoobSettingPlugin)
-            {
-                foreach (CharaDetailDefine cdd in BoobSettingDetailSet.Details)
-                {
-                    CharaDetailInfo cdi = new CharaDetailInfo(chaCtrl, cdd);
-                    addToDetailSet(cdi);
-                    addToUpdateSequence(cdi);
-                }
-            }
-
-            // ABMX detail set
-            if (HasABMXPlugin)
-            {
-                foreach (CharaDetailDefine cdd in AMBXSettingDetailSet.Details)
-                {
-                    CharaDetailInfo cdi = new CharaDetailInfo(chaCtrl, cdd);
-                    addToDetailSet(cdi);
-                    addToUpdateSequence(cdi);
-                }
-            }
 
             // OVERLAY detail set
             if (HasOverlayPlugin)
@@ -1181,11 +1079,6 @@ namespace StudioModsMSG
         public Dictionary<string, object> GetDataDictVanilla()
         {
             return GetDataDictByCatelog(CharaDetailDefine.CharaDetailDefineCatelog.VANILLA);
-        }
-
-        public Dictionary<string, object> GetDataDictABMX()
-        {
-            return GetDataDictByCatelog(CharaDetailDefine.CharaDetailDefineCatelog.ABMX);
         }
 
         public Dictionary<string, object> GetDataDictByKeys(string[] tgtKeys)

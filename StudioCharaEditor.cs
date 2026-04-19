@@ -11,8 +11,6 @@ namespace StudioModsMSG
 {
     [BepInPlugin(GUID, Name, Version)]
     [BepInDependency(KoikatuAPI.GUID, "1.4")]
-    [BepInDependency("mikke.pushUpAI", BepInDependency.DependencyFlags.SoftDependency)]
-    [BepInDependency("com.fairbair.hs2_boobsettings", BepInDependency.DependencyFlags.SoftDependency)]
     [BepInProcess("StudioNEOV2.exe")]
     public class StudioCharaEditor : BaseUnityPlugin
     {
@@ -28,24 +26,15 @@ namespace StudioModsMSG
 
         public static ConfigEntry<bool> VerboseMessage { get; private set; }
 
-        public static ConfigEntry<bool> BreastSoftBodyEnabled { get; private set; }
-        public static ConfigEntry<float> BreastSoftBodyIntensity { get; private set; }
-        public static ConfigEntry<float> BreastSoftBodyStiffness { get; private set; }
-        public static ConfigEntry<float> BreastSoftBodyDamping { get; private set; }
-        public static ConfigEntry<float> BreastSoftBodyMotionInfluence { get; private set; }
-        public static ConfigEntry<float> BreastSoftBodyMaxOffset { get; private set; }
-        public static ConfigEntry<float> BreastSoftBodyWeightThreshold { get; private set; }
-        public static ConfigEntry<float> BreastSoftBodyWaveSpeed { get; private set; }
-        public static ConfigEntry<float> BreastSoftBodyLateralStrength { get; private set; }
-        public static ConfigEntry<float> BreastSoftBodySecondaryAmplitude { get; private set; }
-        public static ConfigEntry<float> BreastSoftBodyGravitySag { get; private set; }
-
         public static ConfigEntry<int> UIXPosition { get; private set; }
         public static ConfigEntry<int> UIYPosition { get; private set; }
         public static ConfigEntry<int>  UIWidth      { get; private set; }
         public static ConfigEntry<int>  UIHeight     { get; private set; }
         public static ConfigEntry<bool> UIDarkMode   { get; private set; }
         public static ConfigEntry<float> UIOpacity   { get; private set; }
+
+        /// <summary>Hold this key + Right-Mouse-Button to enter Manual Deformation mode on cloth.</summary>
+        public static ConfigEntry<KeyboardShortcut> KeyManualDeform { get; private set; }
 
         //private ConfigEntry<string> configGreeting;
         //private ConfigEntry<bool> configDisplayGreeting;
@@ -60,24 +49,17 @@ namespace StudioModsMSG
 
             VerboseMessage = Config.Bind("Debug", "Print verbose info", false, "Print more debug info to console.");
 
-            BreastSoftBodyEnabled = Config.Bind("BreastSoftBody", "Enabled", true, "Enable vertex-level breast softbody for female characters.");
-            BreastSoftBodyIntensity = Config.Bind("BreastSoftBody", "Intensity", 0.65f, "Overall effect strength. Lower values are subtler and safer.");
-            BreastSoftBodyStiffness = Config.Bind("BreastSoftBody", "Stiffness", 38f, "Spring stiffness for vertex softbody simulation.");
-            BreastSoftBodyDamping = Config.Bind("BreastSoftBody", "Damping", 9f, "Velocity damping for vertex softbody simulation.");
-            BreastSoftBodyMotionInfluence = Config.Bind("BreastSoftBody", "MotionInfluence", 0.85f, "How strongly breast-bone movement excites the softbody motion.");
-            BreastSoftBodyMaxOffset = Config.Bind("BreastSoftBody", "MaxOffset", 0.024f, "Maximum local-space vertex displacement in meters.");
-            BreastSoftBodyWeightThreshold = Config.Bind("BreastSoftBody", "WeightThreshold", 0.05f, "Minimum combined breast-bone weight needed to include a vertex.");
-            BreastSoftBodyWaveSpeed = Config.Bind("BreastSoftBody", "WaveSpeed", 5f, "How fast wave ripples propagate across the breast surface. Higher = more dramatic ripple.");
-            BreastSoftBodyLateralStrength = Config.Bind("BreastSoftBody", "LateralStrength", 0.5f, "Strength of lateral (side-to-side) sway relative to primary outward bounce.");
-            BreastSoftBodySecondaryAmplitude = Config.Bind("BreastSoftBody", "SecondaryAmplitude", 0.35f, "Amplitude of secondary high-frequency oscillation layered on top of the primary bounce.");
-            BreastSoftBodyGravitySag = Config.Bind("BreastSoftBody", "GravitySag", 0.003f, "Static downward vertex droop caused by gravity. Adds subtle natural drooping shape.");
-
             UIXPosition = Config.Bind("GUI", "Main GUI X position", 50, "X offset from left in pixel");
             UIYPosition = Config.Bind("GUI", "Main GUI Y position", 300, "Y offset from top in pixel");
             UIWidth     = Config.Bind("GUI", "Main GUI window width",  600, "Main window width, minimum 400, set it when UI is hidden.");
             UIHeight    = Config.Bind("GUI", "Main GUI window height", 400, "Main window height, minimum 150, set it when UI is hidden.");
             UIDarkMode  = Config.Bind("GUI", "Use dark theme", true, "Switch between night mode (black) and day mode (white).");
             UIOpacity   = Config.Bind("GUI", "Window opacity", 0.88f, "Background opacity of the UI window (0=invisible, 1=solid).");
+
+            KeyManualDeform = Config.Bind("Cloth", "Manual Deform hold key",
+                new KeyboardShortcut(KeyCode.D, KeyCode.LeftShift),
+                "Hold this key and Right-Mouse-Button to enter Manual Deformation mode on cloth. " +
+                "While held, drag the mouse near a cloth mesh to sculpt it with physics.");
 
 
             /*

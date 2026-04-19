@@ -83,9 +83,9 @@ namespace StudioModsMSG
 
         private bool IsDarkMode => StudioCharaEditor.UIDarkMode != null && StudioCharaEditor.UIDarkMode.Value;
         // Translucent glass palette ─────────────────────────────────────────
-        private Color WindowBackgroundColor  => IsDarkMode ? new Color(0.12f, 0.14f, 0.20f) : new Color(0.90f, 0.91f, 0.94f);
-        private Color HeaderBackgroundColor  => IsDarkMode ? new Color(0.10f, 0.12f, 0.18f) : new Color(0.82f, 0.83f, 0.87f);
-        private Color CardBackgroundColor    => IsDarkMode ? new Color(0.16f, 0.18f, 0.26f) : new Color(0.94f, 0.95f, 0.97f);
+        private Color WindowBackgroundColor  => IsDarkMode ? new Color(0.518f, 0.51f, 0.561f) : new Color(0.518f, 0.51f, 0.561f);
+        private Color HeaderBackgroundColor  => IsDarkMode ? new Color(0.518f, 0.51f, 0.561f) : new Color(0.518f, 0.51f, 0.561f);
+        private Color CardBackgroundColor    => IsDarkMode ? new Color(0.518f, 0.51f, 0.561f) : new Color(0.518f, 0.51f, 0.561f);
         private Color AccentColor            => IsDarkMode ? new Color(0.22f, 0.75f, 0.88f) : new Color(0.05f, 0.38f, 0.72f);
         private Color AccentSoftColor        => IsDarkMode ? new Color(0.13f, 0.15f, 0.25f) : new Color(0.80f, 0.84f, 0.91f);
         private Color SuccessColor           => IsDarkMode ? new Color(0.28f, 0.90f, 0.48f) : new Color(0.04f, 0.58f, 0.22f);
@@ -148,11 +148,11 @@ namespace StudioModsMSG
 
 
                     mouseInWindow = windowRect.Contains(Event.current.mousePosition);
-                    if (mouseInWindow)
-                    {
-                        Studio.Studio.Instance.cameraCtrl.noCtrlCondition = (() => mouseInWindow && VisibleGUI);
+                    // Always keep the condition delegate fresh so ManualDeformActive is evaluated every frame.
+                    Studio.Studio.Instance.cameraCtrl.noCtrlCondition =
+                        () => (mouseInWindow && VisibleGUI) || ClothSoftBodyRuntime.ManualDeformActive;
+                    if (mouseInWindow || ClothSoftBodyRuntime.ManualDeformActive)
                         Input.ResetInputAxes();
-                    }
                 }
                 catch (Exception ex)
                 {
@@ -213,7 +213,12 @@ namespace StudioModsMSG
             try
             {
                 HandleWindowResize();
+                CharaEditorMgr.Instance.EnsureActiveSelection();
                 SelectionContext sel = CharaEditorMgr.Instance.ActiveSelection;
+
+                // Ensure module names are populated even before any selection change fires
+                if (compatibleModuleNames.Count == 0 && sel != null && sel.CompatibleModules.Count > 0)
+                    RefreshModuleNames();
 
                 DrawGlassWindowShell();
 
@@ -232,7 +237,7 @@ namespace StudioModsMSG
                 GUILayout.BeginArea(contentRect);
                 contentAreaOpen = true;
                 GUILayout.BeginVertical();
-                if (!sel.HasSelection)
+                if (!sel.HasSelection && (sel.CompatibleModules == null || sel.CompatibleModules.Count == 0))
                 {
                     DrawEmptyState();
                 }
@@ -347,15 +352,30 @@ namespace StudioModsMSG
 
         private void DrawSelectionSummary(SelectionContext selection)
         {
-            Rect cardRect = BeginGlassCard();
-            GUILayout.Label("Selection Overview", sectionTitleStyle);
-            GUILayout.Space(8f);
-            DrawStatRow("Target", selection.TargetTypeName, AccentColor);
-            DrawStatRow("Modules", compatibleModuleNames.Count.ToString(), SuccessColor);
-            DrawStatRow("State", compatibleModuleNames.Count > 0 ? "Ready" : "No compatible modules", compatibleModuleNames.Count > 0 ? SuccessColor : WarningColor);
-            GUILayout.Space(10f);
-            GUILayout.Label("The panel is docked as an overlay. Drag the header to move it and use the lower-right corner to resize.", hintStyle);
-            EndGlassCard(cardRect);
+            // When something is selected we skip the section header so the panel
+            // stays flat — just the stats inline without an extra card-in-card header.
+            if (!selection.HasSelection)
+            {
+                Rect cardRect = BeginGlassCard();
+                GUILayout.Label("Selection Overview", sectionTitleStyle);
+                GUILayout.Space(8f);
+                DrawStatRow("Target", "No object selected", WarningColor);
+                DrawStatRow("Modules", compatibleModuleNames.Count.ToString(), SuccessColor);
+                DrawStatRow("State", compatibleModuleNames.Count > 0 ? "Ready" : "No compatible modules",
+                    compatibleModuleNames.Count > 0 ? SuccessColor : WarningColor);
+                GUILayout.Space(8f);
+                GUILayout.Label("Global modules are available. Select an object in the tree for object-specific modules.", hintStyle);
+                EndGlassCard(cardRect);
+                return;
+            }
+
+            // Selection is active — show a compact single-line stat bar without a header.
+            GUILayout.BeginHorizontal();
+            GUILayout.Label(selection.TargetTypeName, rowLabelStyle, GUILayout.ExpandWidth(true));
+            string stateLabel = compatibleModuleNames.Count > 0 ? compatibleModuleNames.Count + " modules" : "No modules";
+            GUILayout.Label(stateLabel, rowValueStyle, GUILayout.Width(100f));
+            GUILayout.EndHorizontal();
+            DrawDivider();
         }
 
         private void DrawModuleWorkspace(SelectionContext selection)
@@ -578,9 +598,23 @@ namespace StudioModsMSG
             }
         }
 
-        internal GUIStyle HintStyleRef => hintStyle;
-        internal Color SuccessColorRef => SuccessColor;
-        internal Color WarningColorRef => WarningColor;
+        private Texture2D _dividerTexture;
+
+        internal void DrawDivider()
+        {
+            if (_dividerTexture == null)
+                _dividerTexture = MakeColorTexture(WithAlpha(BorderColor, 0.55f));
+
+            GUILayout.Space(4f);
+            Rect r = GUILayoutUtility.GetRect(10f, 1f, GUILayout.ExpandWidth(true));
+            GUI.DrawTexture(r, _dividerTexture, ScaleMode.StretchToFill);
+            GUILayout.Space(4f);
+        }
+
+        internal GUIStyle HintStyleRef           => hintStyle;
+        internal GUIStyle ActiveOptionStyleRef    => drawerItemSelectedStyle ?? hintStyle;
+        internal Color SuccessColorRef            => SuccessColor;
+        internal Color WarningColorRef            => WarningColor;
 
         internal void DrawStatRow(string label, string value, Color accent)
         {
@@ -810,25 +844,29 @@ namespace StudioModsMSG
 
             verticalScrollbarStyle = new GUIStyle(GUI.skin.verticalScrollbar);
             verticalScrollbarStyle.normal.background = scrollTrackTexture;
-            verticalScrollbarStyle.hover.background = scrollTrackTexture;
+            verticalScrollbarStyle.hover.background  = scrollTrackTexture;
             verticalScrollbarStyle.active.background = scrollTrackTexture;
-            verticalScrollbarStyle.fixedWidth = 12f;
+            verticalScrollbarStyle.fixedWidth = 7f;
+            verticalScrollbarStyle.border = new RectOffset(0, 0, 0, 0);
 
             verticalScrollbarThumbStyle = new GUIStyle(GUI.skin.verticalScrollbarThumb);
             verticalScrollbarThumbStyle.normal.background = scrollThumbTexture;
-            verticalScrollbarThumbStyle.hover.background = scrollThumbTexture;
+            verticalScrollbarThumbStyle.hover.background  = scrollThumbTexture;
             verticalScrollbarThumbStyle.active.background = scrollThumbTexture;
+            verticalScrollbarThumbStyle.border = new RectOffset(2, 2, 2, 2);
 
             horizontalScrollbarStyle = new GUIStyle(GUI.skin.horizontalScrollbar);
             horizontalScrollbarStyle.normal.background = scrollTrackTexture;
-            horizontalScrollbarStyle.hover.background = scrollTrackTexture;
+            horizontalScrollbarStyle.hover.background  = scrollTrackTexture;
             horizontalScrollbarStyle.active.background = scrollTrackTexture;
-            horizontalScrollbarStyle.fixedHeight = 12f;
+            horizontalScrollbarStyle.fixedHeight = 7f;
+            horizontalScrollbarStyle.border = new RectOffset(0, 0, 0, 0);
 
             horizontalScrollbarThumbStyle = new GUIStyle(GUI.skin.horizontalScrollbarThumb);
             horizontalScrollbarThumbStyle.normal.background = scrollThumbTexture;
-            horizontalScrollbarThumbStyle.hover.background = scrollThumbTexture;
+            horizontalScrollbarThumbStyle.hover.background  = scrollThumbTexture;
             horizontalScrollbarThumbStyle.active.background = scrollThumbTexture;
+            horizontalScrollbarThumbStyle.border = new RectOffset(2, 2, 2, 2);
 
             horizontalSliderStyle = new GUIStyle(GUI.skin.horizontalSlider);
             horizontalSliderStyle.normal.background = sliderTrackTexture;
@@ -948,12 +986,17 @@ namespace StudioModsMSG
         {
             lastSelectedTreeNode = newSel;
             CharaEditorMgr.Instance.UpdateSelection(newSel);
+            RefreshModuleNames();
+        }
+
+        private void RefreshModuleNames()
+        {
             SelectionContext selection = CharaEditorMgr.Instance.ActiveSelection;
+            if (selection == null) return;
             selectedTarget = selection.Target;
             ociTarget = selection.CharacterTarget;
             compatibleModuleNames.Clear();
             compatibleModuleNames.AddRange(selection.CompatibleModules.Select(module => module.DisplayName));
-            //Console.WriteLine("Select change to {0}", ociTarget);
         }
 
     }

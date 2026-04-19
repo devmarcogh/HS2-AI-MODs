@@ -1,0 +1,371 @@
+// ============================================================================
+// ClothSimCompute.compute — GPU xPBD cloth simulation
+//
+// Five kernels:
+//   1. ClothPredict       — Integrate gravity, predict positions
+//   2. ClothSolveEdges    — xPBD stretch constraints (one dispatch per color group)
+//   3. ClothSolveBends    — xPBD bend constraints (one dispatch per color group)
+//   4. ClothSolveCollision— Capsule/sphere + SDF body collision
+//   5. ClothCommit        — Derive velocity, damping, speed clamp, SDF friction
+//
+// Graph coloring guarantees no two edges in the same color group share a vertex,
+// so parallel writes to the predicted-position buffer are race-free.
+//
+// When the SDF body collider is also on GPU, the SDF buffer is read directly
+// without CPU readback — the biggest performance win of the GPU path.
+//
+// Requires: DirectX 11 / Compute Shader 5.0
+// ============================================================================
+
+#pragma kernel ClothPredict
+#pragma kernel ClothSolveEdges
+#pragma kernel ClothSolveBends
+#pragma kernel ClothSolveCollision
+#pragma kernel ClothCommit
+
+// ─── Structs ────────────────────────────────────────────────────
+
+// Must match NativeBridge.NativeCollider layout (StructLayout.Sequential, 60 bytes)
+struct ColliderData
+{
+    float cx, cy, cz;
+    float radius;
+    int   isCapsule;
+    float p1x, p1y, p1z;
+    float vx, vy, vz;
+    float vDotV;
+    int   magneticMode;
+    float magneticStrength;
+    float magneticRange;
+};
+
+// ─── Buffers ────────────────────────────────────────────────────
+
+// Per-vertex state (stride 12 = float3)
+RWStructuredBuffer<float3> _Positions;
+RWStructuredBuffer<float3> _Velocities;
+RWStructuredBuffer<float3> _PredPositions;
+StructuredBuffer<float>    _InvMass;
+StructuredBuffer<int>      _IsPinned;
+
+// Topology (uploaded once, re-used across substeps)
+StructuredBuffer<int2>     _EdgePairs;     // [totalEdges] vertex index pairs
+StructuredBuffer<float>    _EdgeRestLen;   // [totalEdges] rest lengths
+StructuredBuffer<int2>     _BendPairs;     // [totalBends] vertex index pairs
+StructuredBuffer<float>    _BendRestLen;   // [totalBends] rest lengths
+
+// Colliders (per frame)
+StructuredBuffer<ColliderData> _Colliders;
+
+// SDF volume (from GPUSDFBuilder — zero-copy when both on GPU)
+StructuredBuffer<float>    _SDFData;
+
+// ─── Uniforms ───────────────────────────────────────────────────
+
+int   _VertCount;
+float _Gravity;          // gravity * weight
+float _Dt;               // substep delta time
+
+// Constraint params
+float _TildedCompliance;  // 1 / (stretchStiffness * dt²)
+float _BendCompliance;    // 1 / (bendStiffness * dt²)
+float _PressScale;        // 1 - compression * maxCompressionRatio
+
+// Per color-group dispatch
+int   _GroupOffset;       // start index in edge/bend buffer
+int   _GroupCount;        // number of edges/bends in this group
+
+// Collision
+int   _ColCount;
+float _Thickness;
+
+// Commit
+float _InvDt;
+float _Damp;
+float _MaxSpeed;
+float _FrictionZone;
+
+// SDF grid params
+int   _UseSDF;
+float _SDFOriginX, _SDFOriginY, _SDFOriginZ;
+int   _SDFResX, _SDFResY, _SDFResZ;
+float _SDFCellSize;
+float _SDFInvCellSize;
+float _SDFMaxDist;
+
+// ─── SDF helpers ────────────────────────────────────────────────
+
+float SDFSample(float3 wp)
+{
+    float fx = (wp.x - _SDFOriginX) * _SDFInvCellSize;
+    float fy = (wp.y - _SDFOriginY) * _SDFInvCellSize;
+    float fz = (wp.z - _SDFOriginZ) * _SDFInvCellSize;
+
+    // Edge clamp (half-voxel inset to avoid out-of-bounds)
+    fx = clamp(fx, 0.5, (float)_SDFResX - 1.5);
+    fy = clamp(fy, 0.5, (float)_SDFResY - 1.5);
+    fz = clamp(fz, 0.5, (float)_SDFResZ - 1.5);
+
+    int ix = (int)floor(fx - 0.5);
+    int iy = (int)floor(fy - 0.5);
+    int iz = (int)floor(fz - 0.5);
+
+    float fracX = fx - ix - 0.5;
+    float fracY = fy - iy - 0.5;
+    float fracZ = fz - iz - 0.5;
+
+    int sXY = _SDFResX * _SDFResY;
+
+    // 8-corner trilinear interpolation
+    float c000 = _SDFData[ iz      * sXY + iy       * _SDFResX + ix    ];
+    float c100 = _SDFData[ iz      * sXY + iy       * _SDFResX + ix + 1];
+    float c010 = _SDFData[ iz      * sXY + (iy + 1) * _SDFResX + ix    ];
+    float c110 = _SDFData[ iz      * sXY + (iy + 1) * _SDFResX + ix + 1];
+    float c001 = _SDFData[(iz + 1) * sXY + iy       * _SDFResX + ix    ];
+    float c101 = _SDFData[(iz + 1) * sXY + iy       * _SDFResX + ix + 1];
+    float c011 = _SDFData[(iz + 1) * sXY + (iy + 1) * _SDFResX + ix    ];
+    float c111 = _SDFData[(iz + 1) * sXY + (iy + 1) * _SDFResX + ix + 1];
+
+    float c00 = lerp(c000, c100, fracX);
+    float c10 = lerp(c010, c110, fracX);
+    float c01 = lerp(c001, c101, fracX);
+    float c11 = lerp(c011, c111, fracX);
+    float c0  = lerp(c00,  c10,  fracY);
+    float c1  = lerp(c01,  c11,  fracY);
+    return lerp(c0, c1, fracZ);
+}
+
+float3 SDFGradient(float3 wp)
+{
+    float h = _SDFCellSize;
+    return float3(
+        SDFSample(wp + float3(h, 0, 0)) - SDFSample(wp - float3(h, 0, 0)),
+        SDFSample(wp + float3(0, h, 0)) - SDFSample(wp - float3(0, h, 0)),
+        SDFSample(wp + float3(0, 0, h)) - SDFSample(wp - float3(0, 0, h))
+    ) / (2.0 * h);
+}
+
+// ─── Kernel 1: Predict ──────────────────────────────────────────
+// Dispatch: ceil(vertCount / 256), 1, 1
+
+[numthreads(256, 1, 1)]
+void ClothPredict(uint3 id : SV_DispatchThreadID)
+{
+    int i = (int)id.x;
+    if (i >= _VertCount) return;
+
+    float3 pos = _Positions[i];
+    float invM = _InvMass[i];
+
+    if (invM <= 0.0)
+    {
+        _PredPositions[i] = pos;
+        return;
+    }
+
+    float3 vel = _Velocities[i];
+    vel.y += _Gravity * _Dt;
+    _Velocities[i] = vel;
+    _PredPositions[i] = pos + vel * _Dt;
+}
+
+// ─── Kernel 2: Solve Edges (one dispatch per color group) ───────
+// Dispatch: ceil(groupCount / 256), 1, 1
+
+[numthreads(256, 1, 1)]
+void ClothSolveEdges(uint3 id : SV_DispatchThreadID)
+{
+    int eidx = (int)id.x;
+    if (eidx >= _GroupCount) return;
+
+    int bufIdx = _GroupOffset + eidx;
+    int2 edge = _EdgePairs[bufIdx];
+    int i = edge.x, j = edge.y;
+
+    float wi = (_IsPinned[i] != 0) ? 0.0 : _InvMass[i];
+    float wj = (_IsPinned[j] != 0) ? 0.0 : _InvMass[j];
+    if (wi == 0.0 && wj == 0.0) return;
+
+    float wSum = wi + wj + _TildedCompliance;
+    if (wSum < 1e-10) return;
+
+    float3 pi = _PredPositions[i];
+    float3 pj = _PredPositions[j];
+    float3 d  = pi - pj;
+    float distSq = dot(d, d);
+    if (distSq < 1e-14) return;
+
+    float dist    = sqrt(distSq);
+    float invDist = 1.0 / dist;
+    float restL   = _EdgeRestLen[bufIdx];
+    float C       = dist - restL * _PressScale;
+    float lambda  = -C / wSum;
+    float3 corr   = d * invDist * lambda;
+
+    if (_IsPinned[i] == 0) _PredPositions[i] = pi + wi * corr;
+    if (_IsPinned[j] == 0) _PredPositions[j] = pj - wj * corr;
+}
+
+// ─── Kernel 3: Solve Bends (one dispatch per color group) ───────
+// Dispatch: ceil(groupCount / 256), 1, 1
+
+[numthreads(256, 1, 1)]
+void ClothSolveBends(uint3 id : SV_DispatchThreadID)
+{
+    int bidx = (int)id.x;
+    if (bidx >= _GroupCount) return;
+
+    int bufIdx = _GroupOffset + bidx;
+    int2 bp = _BendPairs[bufIdx];
+    int i = bp.x, j = bp.y;
+
+    float wi = (_IsPinned[i] != 0) ? 0.0 : _InvMass[i];
+    float wj = (_IsPinned[j] != 0) ? 0.0 : _InvMass[j];
+    if (wi == 0.0 && wj == 0.0) return;
+
+    float wSum = wi + wj + _BendCompliance;
+    if (wSum < 1e-10) return;
+
+    float3 pi = _PredPositions[i];
+    float3 pj = _PredPositions[j];
+    float3 d  = pi - pj;
+    float distSq = dot(d, d);
+    if (distSq < 1e-14) return;
+
+    float dist    = sqrt(distSq);
+    float invDist = 1.0 / dist;
+    float restL   = _BendRestLen[bufIdx];
+    float C       = dist - restL;
+    float lambda  = -C / wSum;
+    float3 corr   = d * invDist * lambda;
+
+    if (_IsPinned[i] == 0) _PredPositions[i] = pi + wi * corr;
+    if (_IsPinned[j] == 0) _PredPositions[j] = pj - wj * corr;
+}
+
+// ─── Kernel 4: Collision (capsule/sphere + SDF) ─────────────────
+// Dispatch: ceil(vertCount / 256), 1, 1
+
+[numthreads(256, 1, 1)]
+void ClothSolveCollision(uint3 id : SV_DispatchThreadID)
+{
+    int i = (int)id.x;
+    if (i >= _VertCount) return;
+    if (_InvMass[i] <= 0.0) return;
+
+    float3 p = _PredPositions[i];
+
+    // ── Capsule / sphere colliders ──
+    for (int c = 0; c < _ColCount; c++)
+    {
+        ColliderData col = _Colliders[c];
+
+        float3 closest;
+        if (col.isCapsule == 0)
+        {
+            closest = float3(col.cx, col.cy, col.cz);
+        }
+        else
+        {
+            float3 w = p - float3(col.p1x, col.p1y, col.p1z);
+            float3 v = float3(col.vx, col.vy, col.vz);
+            float t = (col.vDotV > 1e-8) ? saturate(dot(w, v) / col.vDotV) : 0.0;
+            closest = float3(col.p1x, col.p1y, col.p1z) + t * v;
+        }
+
+        float3 delta  = p - closest;
+        float  distSq = dot(delta, delta);
+        float  dist   = sqrt(max(distSq, 1e-12));
+        float  minSep = col.radius + _Thickness;
+
+        float3 normal = (dist > 1e-6) ? (delta / dist) : float3(0, 1, 0);
+
+        if (col.magneticMode == 1) // Attract
+        {
+            float range = col.magneticRange;
+            if (dist < range)
+            {
+                float3 onSurface = closest + normal * minSep;
+                float  blend = (dist < minSep) ? 1.0 : saturate(col.magneticStrength);
+                p = lerp(p, onSurface, blend);
+            }
+        }
+        else if (col.magneticMode == 0) // Repel
+        {
+            if (distSq < minSep * minSep)
+                p = closest + normal * minSep;
+        }
+        // magneticMode == 2 (Off): skip
+    }
+
+    // ── SDF body collision ──
+    if (_UseSDF != 0)
+    {
+        float sdfDist = SDFSample(p);
+        if (sdfDist < _Thickness)
+        {
+            float3 grad = SDFGradient(p);
+            float gradLen = length(grad);
+            float pushAmt = _Thickness - sdfDist;
+
+            if (gradLen > 1e-6)
+            {
+                float3 n = grad / gradLen;
+                p += n * pushAmt;
+            }
+            else
+            {
+                p.y += pushAmt;
+            }
+        }
+    }
+
+    _PredPositions[i] = p;
+}
+
+// ─── Kernel 5: Commit ───────────────────────────────────────────
+// Derive velocity from position change, apply damping, clamp speed,
+// strip inward SDF velocity (anti-jitter friction).
+// Dispatch: ceil(vertCount / 256), 1, 1
+
+[numthreads(256, 1, 1)]
+void ClothCommit(uint3 id : SV_DispatchThreadID)
+{
+    int i = (int)id.x;
+    if (i >= _VertCount) return;
+    if (_InvMass[i] <= 0.0) return;
+
+    float3 pos  = _Positions[i];
+    float3 pred = _PredPositions[i];
+    float3 v    = (pred - pos) * _InvDt * _Damp;
+
+    // Speed clamp
+    float speedSq = dot(v, v);
+    float maxSq   = _MaxSpeed * _MaxSpeed;
+    if (speedSq > maxSq)
+        v *= _MaxSpeed * rsqrt(speedSq);
+
+    // SDF surface friction: strip velocity pointing into the body
+    if (_UseSDF != 0)
+    {
+        float sdfDist = SDFSample(pred);
+        if (sdfDist < _FrictionZone)
+        {
+            float3 grad = SDFGradient(pred);
+            float gradLen = length(grad);
+            if (gradLen > 1e-6)
+            {
+                float3 n = grad / gradLen;
+                float vn = dot(v, n);
+                if (vn < 0.0)
+                {
+                    float blend = 1.0 - saturate(sdfDist / _FrictionZone);
+                    v -= n * (vn * blend);
+                }
+            }
+        }
+    }
+
+    _Velocities[i] = v;
+    _Positions[i]  = pred;
+}

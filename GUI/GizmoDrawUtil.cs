@@ -22,6 +22,10 @@ namespace StudioModsMSG
     /// </summary>
     class GizmoDrawUtil
     {
+        private const float DEFAULT_LINE_WIDTH = 0.008f;
+        private const float MIN_LINE_WIDTH = 0.0045f;
+        private const float MAX_LINE_WIDTH = 0.018f;
+
         private Transform                gizmoRoot;
         private readonly List<LineRenderer> linePool   = new List<LineRenderer>();
         private readonly List<Transform>    spherePool = new List<Transform>();
@@ -82,20 +86,46 @@ namespace StudioModsMSG
         // ------------------------------------------------------------------
 
         /// <summary>Draw a world-space line segment.</summary>
-        public void DrawLine(Vector3 start, Vector3 end, Color color, float width = 0.008f)
+        public void DrawLine(Vector3 start, Vector3 end, Color color, float width = DEFAULT_LINE_WIDTH)
         {
             if (!insideFrame) EnsureRoot();
             LineRenderer lr = GetOrCreateLine(lineIndex++);
             lr.gameObject.SetActive(true);
             lr.startColor      = color;
             lr.endColor        = color;
-            lr.widthMultiplier = width;
+            lr.widthMultiplier = ClampLineWidth(width);
             lr.SetPosition(0, start);
             lr.SetPosition(1, end);
         }
 
-        /// <summary>Draw a world-space sphere marker.</summary>
+        /// <summary>
+        /// Draws a wire sphere marker using 3 rings (X/Y/Z axes) with axis colors.
+        /// </summary>
         public void DrawSphere(Vector3 center, float radius, Color color)
+        {
+            DrawWireSphere(center, radius, color, DEFAULT_LINE_WIDTH);
+        }
+
+        /// <summary>
+        /// Draws a 3-ring wire sphere (XY, XZ, YZ) to improve 3D readability.
+        /// </summary>
+        public void DrawWireSphere(Vector3 center, float radius, Color color, float lineWidth = DEFAULT_LINE_WIDTH, int segments = 36)
+        {
+            if (radius <= 0f) return;
+            float w = ClampLineWidth(lineWidth);
+
+            float alpha = color.a;
+            Color cx = new Color(Mathf.Max(0.2f, color.r), color.g * 0.35f, color.b * 0.35f, alpha);
+            Color cy = new Color(color.r * 0.35f, Mathf.Max(0.2f, color.g), color.b * 0.35f, alpha);
+            Color cz = new Color(color.r * 0.35f, color.g * 0.35f, Mathf.Max(0.2f, color.b), alpha);
+
+            DrawWireCircle(center, radius, Vector3.right,   cx, segments, w); // YZ plane
+            DrawWireCircle(center, radius, Vector3.up,      cy, segments, w); // XZ plane
+            DrawWireCircle(center, radius, Vector3.forward, cz, segments, w); // XY plane
+        }
+
+        /// <summary>Draw a world-space solid sphere marker.</summary>
+        public void DrawSolidSphere(Vector3 center, float radius, Color color)
         {
             if (!insideFrame) EnsureRoot();
             Transform sph = GetOrCreateSphere(sphereIndex++);
@@ -106,9 +136,11 @@ namespace StudioModsMSG
         }
 
         /// <summary>Draw an N-segment wire circle in world space.</summary>
-        public void DrawWireCircle(Vector3 center, float radius, Vector3 normal, Color color, int segments = 32, float lineWidth = 0.008f)
+        public void DrawWireCircle(Vector3 center, float radius, Vector3 normal, Color color, int segments = 32, float lineWidth = DEFAULT_LINE_WIDTH)
         {
             if (segments < 3) segments = 3;
+            if (radius <= 0f) return;
+            lineWidth = ClampLineWidth(lineWidth);
             Quaternion rot  = Quaternion.FromToRotation(Vector3.up, normal.sqrMagnitude > 0.001f ? normal.normalized : Vector3.up);
             float      step = 2f * Mathf.PI / segments;
             Vector3    prev = center + rot * new Vector3(radius, 0f, 0f);
@@ -120,6 +152,94 @@ namespace StudioModsMSG
                 DrawLine(prev, curr, color, lineWidth);
                 prev = curr;
             }
+        }
+
+        /// <summary>
+        /// Draw a wire capsule from start to end with adaptive ring density.
+        /// Larger radius automatically adds more cap rings to keep a rounded look.
+        /// </summary>
+        public void DrawWireCapsule(Vector3 start, Vector3 end, float radius, Color color, float lineWidth = DEFAULT_LINE_WIDTH)
+        {
+            if (radius <= 0f) return;
+
+            float w = ClampLineWidth(lineWidth);
+            Vector3 axis = end - start;
+            float axisLen = axis.magnitude;
+            if (axisLen < 0.0001f)
+            {
+                DrawWireSphere(start, radius, color, w);
+                return;
+            }
+
+            axis /= axisLen;
+            GetPerpendicularBasis(axis, out Vector3 right, out Vector3 forward);
+
+            int segments = Mathf.Clamp(24 + Mathf.RoundToInt(radius * 80f), 24, 64);
+            int capRings = Mathf.Clamp(3 + Mathf.RoundToInt(radius * 40f), 3, 12);
+
+            // Cylinder side guide lines
+            DrawLine(start + right * radius,   end + right * radius,   color, w);
+            DrawLine(start - right * radius,   end - right * radius,   color, w);
+            DrawLine(start + forward * radius, end + forward * radius, color, w);
+            DrawLine(start - forward * radius, end - forward * radius, color, w);
+
+            // End rings
+            DrawWireCircle(start, radius, axis, color, segments, w);
+            DrawWireCircle(end,   radius, axis, color, segments, w);
+
+            // Hemispheres with adaptive extra rings
+            for (int i = 1; i <= capRings; i++)
+            {
+                float t = i / (float)(capRings + 1);
+                float ang = t * (Mathf.PI * 0.5f);
+
+                float ringR = Mathf.Cos(ang) * radius;
+                float offset = Mathf.Sin(ang) * radius;
+
+                // Start hemisphere extends opposite to axis
+                DrawWireCircle(start - axis * offset, ringR, axis, color, segments, w);
+
+                // End hemisphere extends with axis
+                DrawWireCircle(end + axis * offset, ringR, axis, color, segments, w);
+            }
+        }
+
+        /// <summary>Draw a wire cube in world space.</summary>
+        public void DrawWireCube(Vector3 center, Vector3 size, Quaternion rotation, Color color, float lineWidth = DEFAULT_LINE_WIDTH)
+        {
+            float w = ClampLineWidth(lineWidth);
+            Vector3 h = size * 0.5f;
+
+            Vector3[] local =
+            {
+                new Vector3(-h.x, -h.y, -h.z),
+                new Vector3( h.x, -h.y, -h.z),
+                new Vector3( h.x, -h.y,  h.z),
+                new Vector3(-h.x, -h.y,  h.z),
+                new Vector3(-h.x,  h.y, -h.z),
+                new Vector3( h.x,  h.y, -h.z),
+                new Vector3( h.x,  h.y,  h.z),
+                new Vector3(-h.x,  h.y,  h.z),
+            };
+
+            Vector3[] p = new Vector3[8];
+            for (int i = 0; i < 8; i++) p[i] = center + rotation * local[i];
+
+            // Bottom
+            DrawLine(p[0], p[1], color, w);
+            DrawLine(p[1], p[2], color, w);
+            DrawLine(p[2], p[3], color, w);
+            DrawLine(p[3], p[0], color, w);
+            // Top
+            DrawLine(p[4], p[5], color, w);
+            DrawLine(p[5], p[6], color, w);
+            DrawLine(p[6], p[7], color, w);
+            DrawLine(p[7], p[4], color, w);
+            // Verticals
+            DrawLine(p[0], p[4], color, w);
+            DrawLine(p[1], p[5], color, w);
+            DrawLine(p[2], p[6], color, w);
+            DrawLine(p[3], p[7], color, w);
         }
 
         /// <summary>Draw RGB axis lines (red=right, green=up, blue=forward).</summary>
@@ -198,6 +318,18 @@ namespace StudioModsMSG
             var rend = sph.GetComponent<Renderer>();
             if (rend != null && rend.sharedMaterial != null)
                 rend.sharedMaterial.color = color;
+        }
+
+        private static float ClampLineWidth(float width)
+        {
+            return Mathf.Clamp(width, MIN_LINE_WIDTH, MAX_LINE_WIDTH);
+        }
+
+        private static void GetPerpendicularBasis(Vector3 axis, out Vector3 right, out Vector3 forward)
+        {
+            Vector3 refAxis = Mathf.Abs(Vector3.Dot(axis, Vector3.up)) > 0.95f ? Vector3.right : Vector3.up;
+            right = Vector3.Cross(axis, refAxis).normalized;
+            forward = Vector3.Cross(right, axis).normalized;
         }
 
         private static Shader GetShader()

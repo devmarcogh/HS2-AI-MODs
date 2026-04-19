@@ -14,9 +14,19 @@ namespace StudioModsMSG
         public BaseUI gui;
         public Dictionary<OCIChar, CharaEditorController> charaEditorCtrlDict = new Dictionary<OCIChar, CharaEditorController>();
         public ModuleRegistry Modules { get; } = new ModuleRegistry();
-        public SelectionContext ActiveSelection { get; private set; } = SelectionContext.Empty;
+        public SelectionContext ActiveSelection { get; private set; }
 
         public static CharaEditorMgr Instance { get; private set; }
+
+        /// <summary>
+        /// Ensures ActiveSelection is never null and always includes global modules.
+        /// Called lazily on first access after Awake.
+        /// </summary>
+        public void EnsureActiveSelection()
+        {
+            if (ActiveSelection == null)
+                ActiveSelection = ResolveSelection(null);
+        }
 
         public static CharaEditorMgr Install(GameObject container)
         {
@@ -35,8 +45,6 @@ namespace StudioModsMSG
 
         private void Awake()
         {
-            
-            RegisterModule(new SoftBodyModule());
             RegisterModule(new ClothPhysicsEditorModule());
         }
 
@@ -97,6 +105,9 @@ namespace StudioModsMSG
                     ctrl.RefreshAccessoriesListIfExpired();
                 }
             }
+
+            // Watch for Joan6694 Dynamic Bone Collider items added to the scene
+            Joan6694ColliderWatcher.Tick();
         }
 
         public CharaEditorController GetEditorController(OCIChar ociTarget)
@@ -139,7 +150,7 @@ namespace StudioModsMSG
         {
             if (node == null)
             {
-                return SelectionContext.Empty;
+                return new SelectionContext(null, null, null, Modules.GetCompatibleModules(null));
             }
 
             ObjectCtrlInfo target = null;
@@ -151,7 +162,7 @@ namespace StudioModsMSG
 
             if (target == null)
             {
-                return SelectionContext.Empty;
+                return new SelectionContext(node, null, null, Modules.GetCompatibleModules(null));
             }
 
             return new SelectionContext(node, target, target as OCIChar, Modules.GetCompatibleModules(target));

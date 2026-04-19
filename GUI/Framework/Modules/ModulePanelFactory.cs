@@ -12,7 +12,6 @@ namespace StudioModsMSG
         {
             return new IModulePanelUI[]
             {
-                new SoftBodyPanel(),
                 new ClothPhysicsPanel(),
             };
         }
