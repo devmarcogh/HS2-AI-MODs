@@ -266,7 +266,7 @@ namespace StudioModsMSG
         public void Simulate(
             Vector3[] positions, Vector3[] velocities,
             float[] invMass, bool[] isPinned,
-            int vertCount,
+            int vertCount, int padFreeCount,
             NativeBridge.NativeCollider[] colliders, int colCount,
             float gravity, float dt, int substeps, int iterations,
             float tildedCompliance, float bendCompliance,
@@ -328,7 +328,7 @@ namespace StudioModsMSG
                 _shader.SetFloat("_FrictionZone", frictionZone);
             }
 
-            int vertGroups = (vertCount + 255) / 256;
+            int vertGroups = padFreeCount > 0 ? (padFreeCount / 256) : 1;
 
             // ── 6. Substep loop (all on GPU — no CPU round-trips) ──
             float subDt = dt / Mathf.Max(1, substeps);

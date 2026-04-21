@@ -1,19 +1,10 @@
 // ============================================================================
-// SDFBuildCompute.compute — GPU SDF builder for cloth body collision
+// SDFBuildCompute.compute — GPU SDF builder (Optimized)
 //
-// Three kernels:
-//   1. SkinVertices  — 4-bone LBS on GPU (64 threads/group)
-//   2. BuildSDF      — Per-voxel closest vertex + K-nearest sign voting
-//   3. SmoothSDF     — 3×3×3 Gaussian blur to eliminate Voronoi-valley jitter
-//
-// The BuildSDF kernel uses distance-weighted normal voting from the K nearest
-// vertices to determine inside/outside sign, instead of relying on a single
-// vertex normal. This prevents sign flips from erratic proxy normals.
-//
-// The SmoothSDF pass then blurs the raw SDF, filling the valleys between
-// Voronoi cells so the gradient field is smooth for XPBD collision response.
-//
-// Requires: DirectX 11 / Compute Shader 5.0
+// Mejoras implementadas:
+// - Desenrollado manual del K-Nearest insertion sort en variables escalares
+//   para forzar el uso de registros de GPU, evitando indexación dinámica 
+//   costosa en la memoria local (Groupshared/L1).
 // ============================================================================
 
 #pragma kernel BuildSDF
@@ -45,19 +36,14 @@ struct BindVertex
 
 // ─── Buffers ────────────────────────────────────────────────────
 
-// BuildSDF kernel
-StructuredBuffer<VertexData>   _SkinnedVertices;  // skinned world-space positions + normals
-RWStructuredBuffer<float>      _SDFOutput;         // [totalVoxels] output (raw, pre-smooth)
-
-// SmoothSDF kernel (ping-pong)
-StructuredBuffer<float>        _SDFInput;          // input  for smoothing (reads raw)
-RWStructuredBuffer<float>      _SDFSmoothed;       // output for smoothing (writes blurred)
-
-// SkinVertices kernel
-StructuredBuffer<BindVertex>   _BindVertices;      // rest-pose positions + normals
-StructuredBuffer<BoneData>     _BoneDataBuf;       // per-vertex bone indices + weights
-StructuredBuffer<float4x4>     _BoneMatrices;      // world-space skinning matrices
-RWStructuredBuffer<VertexData>  _SkinnedOutput;    // output skinned positions + normals
+StructuredBuffer<VertexData>   _SkinnedVertices;
+RWStructuredBuffer<float>      _SDFOutput;
+StructuredBuffer<float>        _SDFInput;
+RWStructuredBuffer<float>      _SDFSmoothed;
+StructuredBuffer<BindVertex>   _BindVertices;
+StructuredBuffer<BoneData>     _BoneDataBuf;
+StructuredBuffer<float4x4>     _BoneMatrices;
+RWStructuredBuffer<VertexData>  _SkinnedOutput;
 
 // ─── Uniforms ───────────────────────────────────────────────────
 int   _VertCount;
@@ -71,17 +57,6 @@ float _CellSize;
 float _MaxDist;
 
 // ─── BuildSDF kernel ────────────────────────────────────────────
-// Dispatch: ceil(resX/4), ceil(resY/4), ceil(resZ/4)
-//
-// For each voxel: find the closest vertex for unsigned distance,
-// then use distance-weighted normal voting from K nearest vertices
-// to determine the sign. This avoids sign flips from a single
-// bad normal (common with Dynamic Bone proxy meshes).
-// ────────────────────────────────────────────────────────────────
-
-// K-nearest for sign voting. 4 is a good balance:
-// robust against 1-2 bad normals without too many registers.
-#define K_NEAREST 4
 
 [numthreads(4, 4, 4)]
 void BuildSDF(uint3 id : SV_DispatchThreadID)
@@ -100,64 +75,82 @@ void BuildSDF(uint3 id : SV_DispatchThreadID)
         _OriginY + vy * _CellSize,
         _OriginZ + vz * _CellSize);
 
-    // ── Find K nearest vertices (insertion sort into small array) ──
-    float kDistSq[K_NEAREST];
-    int   kIdx[K_NEAREST];
-    [unroll] for (int k = 0; k < K_NEAREST; k++)
-    {
-        kDistSq[k] = 1e30;
-        kIdx[k]    = -1;
-    }
+    // ── K-nearest registers (Optimizado sin arreglos para forzar registros) ──
+    float d0 = 1e30, d1 = 1e30, d2 = 1e30, d3 = 1e30;
+    int   i0 = -1,   i1 = -1,   i2 = -1,   i3 = -1;
 
     for (int i = 0; i < _VertCount; i++)
     {
         float3 vp = _SkinnedVertices[i].position;
-        float3 d  = voxelPos - vp;
-        float dSq = dot(d, d);
+        float3 d_vec = voxelPos - vp;
+        float dSq = dot(d_vec, d_vec);
 
-        // Insert into sorted K-nearest if closer than the farthest
-        if (dSq < kDistSq[K_NEAREST - 1])
+        // Insertion sort explícito sobre registros
+        if (dSq < d3)
         {
-            kDistSq[K_NEAREST - 1] = dSq;
-            kIdx[K_NEAREST - 1]    = i;
-
-            // Bubble towards front to maintain sorted order
-            [unroll] for (int s = K_NEAREST - 1; s > 0; s--)
+            if (dSq < d2)
             {
-                if (kDistSq[s] < kDistSq[s - 1])
+                if (dSq < d1)
                 {
-                    float tmpD  = kDistSq[s]; kDistSq[s] = kDistSq[s-1]; kDistSq[s-1] = tmpD;
-                    int   tmpI  = kIdx[s];    kIdx[s]    = kIdx[s-1];    kIdx[s-1]    = tmpI;
+                    if (dSq < d0)
+                    {
+                        d3 = d2; i3 = i2;
+                        d2 = d1; i2 = i1;
+                        d1 = d0; i1 = i0;
+                        d0 = dSq; i0 = i;
+                    }
+                    else
+                    {
+                        d3 = d2; i3 = i2;
+                        d2 = d1; i2 = i1;
+                        d1 = dSq; i1 = i;
+                    }
                 }
+                else
+                {
+                    d3 = d2; i3 = i2;
+                    d2 = dSq; i2 = i;
+                }
+            }
+            else
+            {
+                d3 = dSq; i3 = i;
             }
         }
     }
 
-    if (kIdx[0] < 0)
+    if (i0 < 0)
     {
         _SDFOutput[vi] = _MaxDist;
         return;
     }
 
-    // ── Unsigned distance from closest vertex ──
-    float dist = sqrt(kDistSq[0]);
+    float dist = sqrt(d0);
 
     // ── Distance-weighted sign voting from K nearest ──
-    // Weight = 1/dist² so closer vertices dominate the vote.
-    // signAccum > 0 → outside, signAccum < 0 → inside.
     float signAccum = 0.0;
-    float closestDSq = kDistSq[0];
-    float epsilon = closestDSq * 0.01 + 1e-10; // prevent div-by-zero
+    float epsilon = d0 * 0.01 + 1e-10;
 
-    [unroll] for (int n = 0; n < K_NEAREST; n++)
-    {
-        if (kIdx[n] < 0) break;
-
-        float3 toVoxel = voxelPos - _SkinnedVertices[kIdx[n]].position;
-        float3 normal  = _SkinnedVertices[kIdx[n]].normal;
-        float  vote    = dot(toVoxel, normal); // positive = outside
-        float  weight  = 1.0 / (kDistSq[n] + epsilon);
-        signAccum += vote * weight;
+    // Helper macro manual para no repetir el código del voto
+    if (i0 >= 0) {
+        float3 n = _SkinnedVertices[i0].normal;
+        float3 v = voxelPos - _SkinnedVertices[i0].position;
+        signAccum += dot(v, n) * (1.0 / (d0 + epsilon));
+    }
+    if (i1 >= 0) {
+        float3 n = _SkinnedVertices[i1].normal;
+        float3 v = voxelPos - _SkinnedVertices[i1].position;
+        signAccum += dot(v, n) * (1.0 / (d1 + epsilon));
+    }
+    if (i2 >= 0) {
+        float3 n = _SkinnedVertices[i2].normal;
+        float3 v = voxelPos - _SkinnedVertices[i2].position;
+        signAccum += dot(v, n) * (1.0 / (d2 + epsilon));
+    }
+    if (i3 >= 0) {
+        float3 n = _SkinnedVertices[i3].normal;
+        float3 v = voxelPos - _SkinnedVertices[i3].position;
+        signAccum += dot(v, n) * (1.0 / (d3 + epsilon));
     }
 
     float sign = (signAccum >= 0.0) ? 1.0 : -1.0;
@@ -165,7 +158,7 @@ void BuildSDF(uint3 id : SV_DispatchThreadID)
 }
 
 // ─── SkinVertices kernel ────────────────────────────────────────
-// Optional GPU skinning. Dispatch: ceil(vertCount/64), 1, 1
+
 [numthreads(64, 1, 1)]
 void SkinVertices(uint3 id : SV_DispatchThreadID)
 {
@@ -180,7 +173,7 @@ void SkinVertices(uint3 id : SV_DispatchThreadID)
 
     float4 p4 = float4(bindP, 1.0);
     float4 n4 = float4(bindN, 0.0);
-
+    
     float3 pos = float3(0, 0, 0);
     float3 nor = float3(0, 0, 0);
 
@@ -218,14 +211,6 @@ void SkinVertices(uint3 id : SV_DispatchThreadID)
 }
 
 // ─── SmoothSDF kernel ──────────────────────────────────────────
-// 3×3×3 Gaussian blur to smooth the raw vertex-distance SDF.
-// Eliminates Voronoi-valley jitter: the gradient field becomes
-// continuous, so XPBD collision response won't oscillate when
-// particles slide across vertex boundaries.
-//
-// Dispatch: ceil(resX/4), ceil(resY/4), ceil(resZ/4)
-// Reads from _SDFInput, writes to _SDFSmoothed (ping-pong).
-// ────────────────────────────────────────────────────────────────
 
 [numthreads(4, 4, 4)]
 void SmoothSDF(uint3 id : SV_DispatchThreadID)
@@ -237,14 +222,8 @@ void SmoothSDF(uint3 id : SV_DispatchThreadID)
     if (vx >= _ResX || vy >= _ResY || vz >= _ResZ)
         return;
 
-    // 3×3×3 Gaussian weights (σ ≈ 0.85, center-heavy to preserve detail)
-    // Layout: center=0.125, face=0.0625, edge=0.03125, corner=0.015625
-    // Total weight for normalization is computed on-the-fly (boundary voxels
-    // skip out-of-bounds neighbors).
-
     float sum    = 0.0;
     float wTotal = 0.0;
-
     int rxy = _ResX * _ResY;
 
     [unroll] for (int dz = -1; dz <= 1; dz++)
@@ -254,19 +233,16 @@ void SmoothSDF(uint3 id : SV_DispatchThreadID)
         int nx = vx + dx;
         int ny = vy + dy;
         int nz = vz + dz;
-
-        if (nx < 0 || nx >= _ResX ||
-            ny < 0 || ny >= _ResY ||
-            nz < 0 || nz >= _ResZ)
+        
+        if (nx < 0 || nx >= _ResX || ny < 0 || ny >= _ResY || nz < 0 || nz >= _ResZ)
             continue;
-
-        // Manhattan distance → weight tier
+            
         int manhattan = abs(dx) + abs(dy) + abs(dz);
         float w;
-        if      (manhattan == 0) w = 8.0;  // center
-        else if (manhattan == 1) w = 4.0;  // face neighbor
-        else if (manhattan == 2) w = 2.0;  // edge neighbor
-        else                     w = 1.0;  // corner neighbor
+        if      (manhattan == 0) w = 8.0;
+        else if (manhattan == 1) w = 4.0;
+        else if (manhattan == 2) w = 2.0;
+        else                     w = 1.0;
 
         int ni = nz * rxy + ny * _ResX + nx;
         sum    += _SDFInput[ni] * w;

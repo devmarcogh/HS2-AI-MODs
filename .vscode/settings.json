@@ -3,5 +3,6 @@
     "chat.tools.terminal.autoApprove": {
         "dotnet build": true,
         "dotnet nuget": true
-    }
+    },
+    "cmake.sourceDirectory": "C:/Users/marco/Dev/Visual studio/HS2-AI-MODs/Native"
 }

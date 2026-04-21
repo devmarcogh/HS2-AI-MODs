@@ -89,16 +89,6 @@ SMODS_API void SHash_Destroy(int64_t handle);
 
 // ─── Forward Skinning (batch) ───────────────────────────────────
 
-/// Batch forward-skin sbVertexCount vertices using precomputed skin matrices.
-/// Outputs world-space positions.
-SMODS_API void Skin_ForwardBatch(
-    const Vec3*            bindVertices,    // all mesh vertices (bind pose)
-    const BoneWeightNative* boneWeights,    // per-vertex bone weights
-    const Mat4x4*          skinMatrices,    // precomputed bone matrices
-    const int*             sbVertexIndices, // which vertices to skin
-    int                    sbCount,
-    float*                 outWorldPos      // [sbCount * 3] output
-);
 
 // ─── Cloth xPBD Solver ──────────────────────────────────────────
 
@@ -199,4 +189,5 @@ SMODS_API void SDF_CollideVertices(
     int resX, int resY, int resZ,
     float originX, float originY, float originZ,
     float invCellSize, float maxDist,
-    float thickness);
+    float thickness,
+    float gradientFactor);

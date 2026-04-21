@@ -73,10 +73,6 @@ namespace StudioModsMSG
         private float       _invCellSize;
         private float       _maxDist;       // sentinel for "no data" voxels
 
-        // ── Spatial hash for fast nearest-vertex during SDF build ──────
-        private readonly SpatialHashGrid _vertexGrid = new SpatialHashGrid();
-        private readonly ThreadLocal<List<int>> _tlQueryBuf =
-            new ThreadLocal<List<int>>(() => new List<int>(32));
 
         // ── Frame throttle ─────────────────────────────────────────────
         private int _frameCounter;
@@ -123,6 +119,7 @@ namespace StudioModsMSG
         public int   SDFResZ      => _resZ;
         public float SDFCellSize  => _cellSizeActual;
         public float SDFMaxDist   => _maxDist;
+        public float[] GetSDFDataInternal() => _sdfData;
 
         /// <summary>
         /// Returns the GPU SDF buffer if the GPU path is active, otherwise null.
@@ -307,7 +304,6 @@ namespace StudioModsMSG
                 // GPU SDF build + readback to _sdfData
                 _gpuBuilder.BuildSDF(_vertCount, _origin, _resX, _resY, _resZ,
                                      _cellSizeActual, _maxDist, _sdfData);
-
                 IsReady = true;
                 return;
             }
@@ -339,20 +335,15 @@ namespace StudioModsMSG
                     _skinnedNormal[i] = new float3(_nSkinnedNormal[i * 3], _nSkinnedNormal[i * 3 + 1], _nSkinnedNormal[i * 3 + 2]);
                 }
             }
-            else
-            {
-                SkinAll();
-            }
 
             // ── 3. AABB + grid dimensions ──
             ComputeGridParams();
 
-            // ── 4. Build SDF (native or managed) ──
-            float hashCell = math.max(0.04f, _cellSizeActual * 3f);
-            float queryRadius = hashCell * 2f;
-
+            // ── 4. Build SDF (Native path) ──
             if (NativeAvailable && _nativeSDFHandle != 0)
             {
+                float hashCell = math.max(0.04f, _cellSizeActual * 3f);
+                float queryRadius = hashCell * 2f;
                 NativeBridge.SDF_Build(
                     _nativeSDFHandle,
                     _nSkinnedPos, _nSkinnedNormal, _vertCount,
@@ -361,11 +352,6 @@ namespace StudioModsMSG
                     _cellSizeActual, _maxDist,
                     hashCell, queryRadius,
                     _sdfData);
-            }
-            else
-            {
-                _vertexGrid.Build(_skinnedPos, hashCell);
-                BuildSDFParallel(queryRadius);
             }
 
             IsReady = true;
@@ -408,280 +394,6 @@ namespace StudioModsMSG
                 _sdfData = new float[_totalVoxels];
         }
 
-        // ================================================================ //
-        //  SDF Queries (thread-safe, read-only after UpdateSDF)
-        // ================================================================ //
-
-        /// <summary>
-        /// Samples the signed distance at a world-space position via trilinear interpolation.
-        /// Positive = outside body, negative = inside body.
-        /// Returns _maxDist if outside the SDF volume.
-        /// </summary>
-        public float SampleDistance(float3 worldPos)
-        {
-            float3 local = (worldPos - _origin) * _invCellSize;
-
-            if (local.x < 0 || local.y < 0 || local.z < 0 ||
-                local.x >= _resX - 1 || local.y >= _resY - 1 || local.z >= _resZ - 1)
-                return _maxDist;
-
-            int ix = (int)local.x, iy = (int)local.y, iz = (int)local.z;
-            float fx = local.x - ix, fy = local.y - iy, fz = local.z - iz;
-
-            float c000 = _sdfData[Idx(ix,   iy,   iz  )];
-            float c100 = _sdfData[Idx(ix+1, iy,   iz  )];
-            float c010 = _sdfData[Idx(ix,   iy+1, iz  )];
-            float c110 = _sdfData[Idx(ix+1, iy+1, iz  )];
-            float c001 = _sdfData[Idx(ix,   iy,   iz+1)];
-            float c101 = _sdfData[Idx(ix+1, iy,   iz+1)];
-            float c011 = _sdfData[Idx(ix,   iy+1, iz+1)];
-            float c111 = _sdfData[Idx(ix+1, iy+1, iz+1)];
-
-            float c00 = c000 + (c100 - c000) * fx;
-            float c10 = c010 + (c110 - c010) * fx;
-            float c01 = c001 + (c101 - c001) * fx;
-            float c11 = c011 + (c111 - c011) * fx;
-
-            float c0 = c00 + (c10 - c00) * fy;
-            float c1 = c01 + (c11 - c01) * fy;
-
-            return c0 + (c1 - c0) * fz;
-        }
-
-        /// <summary>
-        /// Samples the SDF gradient (outward surface normal direction) via central differences.
-        /// </summary>
-        public float3 SampleGradient(float3 worldPos)
-        {
-            // Clamp factor to avoid unstable tiny steps or over-smoothed normals.
-            float factor = Mathf.Clamp(gradientSampleFactor, 0.75f, 2.0f);
-            float h = _cellSizeActual * factor;
-
-            float dx = SampleDistance(worldPos + new float3(h, 0, 0)) -
-                       SampleDistance(worldPos - new float3(h, 0, 0));
-            float dy = SampleDistance(worldPos + new float3(0, h, 0)) -
-                       SampleDistance(worldPos - new float3(0, h, 0));
-            float dz = SampleDistance(worldPos + new float3(0, 0, h)) -
-                       SampleDistance(worldPos - new float3(0, 0, h));
-
-            return new float3(dx, dy, dz) / (2f * h);
-        }
-
-        // ================================================================ //
-        //  Internal — LBS skinning + normal transform
-        // ================================================================ //
-
-        private void SkinAll()
-        {
-            float3[]   bind    = _bindLocal;
-            float3[]   bindN   = _bindNormal;
-            int4[]     bIdx    = _boneIdx;
-            float4[]   bW      = _boneW;
-            float4x4[] bMats   = _boneMatrices;
-            Vector3[]  outPos  = _skinnedPos;
-            float3[]   outNorm = _skinnedNormal;
-            int        count   = _vertCount;
-
-            if (count > 64)
-            {
-                Parallel.For(0, count, i =>
-                {
-                    SkinVertex(bind[i], bindN[i], bIdx[i], bW[i], bMats,
-                               out outPos[i], out outNorm[i]);
-                });
-            }
-            else
-            {
-                for (int i = 0; i < count; i++)
-                    SkinVertex(bind[i], bindN[i], bIdx[i], bW[i], bMats,
-                               out outPos[i], out outNorm[i]);
-            }
-        }
-
-        private static void SkinVertex(float3 bindP, float3 bindN, int4 idx, float4 w,
-                                        float4x4[] mats, out Vector3 outPos, out float3 outNorm)
-        {
-            float4 p4 = new float4(bindP, 1f);
-            float4 n4 = new float4(bindN, 0f); // w=0: direction, no translation
-
-            float3 pos = float3.zero;
-            float3 nor = float3.zero;
-
-            if (w.x > 0f) { pos += math.mul(mats[idx.x], p4).xyz * w.x;
-                             nor += math.mul(mats[idx.x], n4).xyz * w.x; }
-            if (w.y > 0f) { pos += math.mul(mats[idx.y], p4).xyz * w.y;
-                             nor += math.mul(mats[idx.y], n4).xyz * w.y; }
-            if (w.z > 0f) { pos += math.mul(mats[idx.z], p4).xyz * w.z;
-                             nor += math.mul(mats[idx.z], n4).xyz * w.z; }
-            if (w.w > 0f) { pos += math.mul(mats[idx.w], p4).xyz * w.w;
-                             nor += math.mul(mats[idx.w], n4).xyz * w.w; }
-
-            outPos  = new Vector3(pos.x, pos.y, pos.z);
-            outNorm = math.normalizesafe(nor, new float3(0, 1, 0));
-        }
-
-        // ================================================================ //
-        //  Internal — Parallel SDF build (vertex-distance)
-        // ================================================================ //
-
-        /// <summary>
-        /// For each voxel, finds the nearest skinned vertex via the spatial hash
-        /// and writes the signed distance. Fully parallel — no write contention
-        /// because each voxel writes to its own unique index.
-        /// </summary>
-        private void BuildSDFParallel(float queryRadius)
-        {
-            float[]    sdf    = _sdfData;
-            int        rx     = _resX, ry = _resY, rz = _resZ;
-            int        total  = _totalVoxels;
-            float3     origin = _origin;
-            float      cs     = _cellSizeActual;
-            float      maxD   = _maxDist;
-            Vector3[]  vPos   = _skinnedPos;
-            float3[]   vNorm  = _skinnedNormal;
-            float      qr     = queryRadius;
-            SpatialHashGrid grid = _vertexGrid;
-
-            if (total > 256)
-            {
-                Parallel.For(0, total, vi =>
-                {
-                    sdf[vi] = ComputeVoxelSDF(vi, rx, ry, origin, cs, maxD,
-                                              vPos, vNorm, qr, grid, _tlQueryBuf.Value);
-                });
-            }
-            else
-            {
-                var buf = new List<int>(32);
-                for (int vi = 0; vi < total; vi++)
-                    sdf[vi] = ComputeVoxelSDF(vi, rx, ry, origin, cs, maxD,
-                                              vPos, vNorm, qr, grid, buf);
-            }
-
-            // 3×3×3 Gaussian smoothing pass (matches GPU + native paths)
-            SmoothSDFInPlace(sdf, rx, ry, rz, total);
-        }
-
-        /// <summary>
-        /// In-place 3×3×3 weighted blur over the SDF volume.
-        /// Smooths Voronoi valleys so the gradient is continuous for XPBD.
-        /// </summary>
-        private static void SmoothSDFInPlace(float[] sdf, int rx, int ry, int rz, int total)
-        {
-            float[] temp = new float[total];
-            int rxy = rx * ry;
-
-            for (int vi = 0; vi < total; vi++)
-            {
-                int vz = vi / rxy;
-                int rem = vi - vz * rxy;
-                int vy2 = rem / rx;
-                int vx2 = rem - vy2 * rx;
-
-                float sum = 0f;
-                float wTotal = 0f;
-
-                for (int dz = -1; dz <= 1; dz++)
-                for (int dy = -1; dy <= 1; dy++)
-                for (int dx = -1; dx <= 1; dx++)
-                {
-                    int nx = vx2 + dx, ny = vy2 + dy, nz = vz + dz;
-                    if (nx < 0 || nx >= rx || ny < 0 || ny >= ry || nz < 0 || nz >= rz)
-                        continue;
-                    int manhattan = Math.Abs(dx) + Math.Abs(dy) + Math.Abs(dz);
-                    float w;
-                    if      (manhattan == 0) w = 8f;
-                    else if (manhattan == 1) w = 4f;
-                    else if (manhattan == 2) w = 2f;
-                    else                     w = 1f;
-                    sum += sdf[nz * rxy + ny * rx + nx] * w;
-                    wTotal += w;
-                }
-                temp[vi] = sum / wTotal;
-            }
-            Array.Copy(temp, sdf, total);
-        }
-
-        /// <summary>
-        /// Pure function: compute signed distance for a single voxel.
-        /// Thread-safe — only reads from shared data, writes to caller-provided buffer.
-        /// </summary>
-        private static float ComputeVoxelSDF(
-            int vi, int rx, int ry,
-            float3 origin, float cs, float maxD,
-            Vector3[] vPos, float3[] vNorm,
-            float qr, SpatialHashGrid grid, List<int> queryBuf)
-        {
-            // Voxel index → 3D coordinates
-            int rxy    = rx * ry;
-            int vz     = vi / rxy;
-            int remain = vi - vz * rxy;
-            int vy     = remain / rx;
-            int vx     = remain - vy * rx;
-
-            Vector3 voxelPos = new Vector3(
-                origin.x + vx * cs,
-                origin.y + vy * cs,
-                origin.z + vz * cs);
-
-            // Query spatial hash for nearby vertices
-            grid.Query(voxelPos, qr, queryBuf);
-
-            // K-nearest for sign voting (matches GPU + native paths)
-            const int K_NEAREST = 4;
-            float[] kDistSq = new float[K_NEAREST];
-            int[]   kIdx    = new int[K_NEAREST];
-            for (int k = 0; k < K_NEAREST; k++) { kDistSq[k] = float.MaxValue; kIdx[k] = -1; }
-
-            for (int qi = 0; qi < queryBuf.Count; qi++)
-            {
-                int pidx = queryBuf[qi];
-                float dx = voxelPos.x - vPos[pidx].x;
-                float dy = voxelPos.y - vPos[pidx].y;
-                float dz = voxelPos.z - vPos[pidx].z;
-                float dSq = dx * dx + dy * dy + dz * dz;
-
-                if (dSq < kDistSq[K_NEAREST - 1])
-                {
-                    kDistSq[K_NEAREST - 1] = dSq;
-                    kIdx[K_NEAREST - 1] = pidx;
-                    // Bubble sort towards front
-                    for (int s = K_NEAREST - 1; s > 0; s--)
-                    {
-                        if (kDistSq[s] < kDistSq[s - 1])
-                        {
-                            float tmpD = kDistSq[s]; kDistSq[s] = kDistSq[s-1]; kDistSq[s-1] = tmpD;
-                            int   tmpI = kIdx[s];    kIdx[s]    = kIdx[s-1];    kIdx[s-1]    = tmpI;
-                        }
-                    }
-                }
-            }
-
-            if (kIdx[0] < 0)
-                return maxD;
-
-            float dist = (float)Math.Sqrt(kDistSq[0]);
-
-            // Distance-weighted sign voting from K nearest vertices
-            float signAccum = 0f;
-            float epsilon = kDistSq[0] * 0.01f + 1e-10f;
-            for (int n = 0; n < K_NEAREST; n++)
-            {
-                if (kIdx[n] < 0) break;
-                float3 toVoxel = new float3(
-                    voxelPos.x - vPos[kIdx[n]].x,
-                    voxelPos.y - vPos[kIdx[n]].y,
-                    voxelPos.z - vPos[kIdx[n]].z);
-                float vote   = math.dot(toVoxel, vNorm[kIdx[n]]);
-                float weight = 1f / (kDistSq[n] + epsilon);
-                signAccum += vote * weight;
-            }
-
-            return (signAccum >= 0f) ? dist : -dist;
-        }
-
-        // ── Voxel indexing ─────────────────────────────────────────────
-        private int Idx(int x, int y, int z) => x + y * _resX + z * _resX * _resY;
 
         /// <summary>
         /// Release GPU and native resources. Call when this collider is no longer needed.

@@ -1,0 +1,7 @@
+{
+    "label": "copy-and-run",
+    "dependsOn": ["build"],
+    "type": "shell",
+    "command": "${workspaceFolder}/postbuild_copy_and_run.bat",
+    "problemMatcher": []
+}

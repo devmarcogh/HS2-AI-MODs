@@ -24,7 +24,7 @@ if (!(Test-Path $buildDir)) {
 
 Push-Location $buildDir
 try {
-    # Configure — auto-detect VS version
+    # Configure - auto-detect VS version
     Write-Host "Configuring with CMake..." -ForegroundColor Yellow
     
     $generators = @(
@@ -36,17 +36,21 @@ try {
     $configured = $false
     foreach ($gen in $generators) {
         Write-Host "  Trying: $gen" -ForegroundColor Gray
-        cmake .. -G $gen -A x64 2>&1 | Out-Null
+        # Redirigimos error a null para que no ensucie la consola si falla un generador
+        cmake .. -G $gen -A x64 2>$null | Out-Null
         if ($LASTEXITCODE -eq 0) {
             Write-Host "  Using: $gen" -ForegroundColor Green
             $configured = $true
             break
         }
         # Clean failed cache before retrying
-        Remove-Item CMakeCache.txt -ErrorAction SilentlyContinue
-        Remove-Item CMakeFiles -Recurse -Force -ErrorAction SilentlyContinue
+        if (Test-Path CMakeCache.txt) { Remove-Item CMakeCache.txt -Force }
+        if (Test-Path CMakeFiles) { Remove-Item CMakeFiles -Recurse -Force }
     }
-    if (-not $configured) { throw "CMake configure failed — no supported Visual Studio found" }
+
+    if (-not $configured) { 
+        throw "CMake configure failed - no supported Visual Studio found" 
+    }
 
     # Build
     Write-Host "Building..." -ForegroundColor Yellow
@@ -55,19 +59,22 @@ try {
 
     $dllPath = Join-Path $buildDir "bin\$Config\StudioModsNative.dll"
     if (!(Test-Path $dllPath)) {
-        # Some generators put it directly in bin/
         $dllPath = Join-Path $buildDir "bin\StudioModsNative.dll"
     }
 
     if (Test-Path $dllPath) {
         Write-Host "Success: $dllPath" -ForegroundColor Green
         Write-Host ""
-        Write-Host "To install, copy to your game's Plugins folder:" -ForegroundColor Cyan
+        Write-Host "To install, copy to your game plugins folder:" -ForegroundColor Cyan
         Write-Host "  Copy-Item `"$dllPath`" `"D:\Documents\CAARP\StudioNEOV2_Data\Plugins\`"" -ForegroundColor White
     }
     else {
-        Write-Host "Warning: DLL not found at expected path. Check build output above." -ForegroundColor Yellow
+        Write-Host "Warning: DLL not found at expected path." -ForegroundColor Yellow
     }
+}
+catch {
+    Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Red
+    exit 1
 }
 finally {
     Pop-Location

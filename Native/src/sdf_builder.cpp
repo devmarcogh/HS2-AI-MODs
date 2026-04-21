@@ -336,18 +336,9 @@ SMODS_API float SDF_Sample(
     float ly = (wy - originY) * invCellSize;
     float lz = (wz - originZ) * invCellSize;
 
-    // Clamp to valid interpolation range instead of returning maxDist at edges.
-    // This avoids discontinuous "walls" at the SDF volume boundary.
-    lx = std::max(0.0f, std::min(lx, (float)(resX - 1) - 1e-4f));
-    ly = std::max(0.0f, std::min(ly, (float)(resY - 1) - 1e-4f));
-    lz = std::max(0.0f, std::min(lz, (float)(resZ - 1) - 1e-4f));
-
-    // Still return maxDist if completely outside the padded region
-    float lxRaw = (wx - originX) * invCellSize;
-    float lyRaw = (wy - originY) * invCellSize;
-    float lzRaw = (wz - originZ) * invCellSize;
-    if (lxRaw < -1.0f || lyRaw < -1.0f || lzRaw < -1.0f ||
-        lxRaw > resX || lyRaw > resY || lzRaw > resZ)
+    // Early return limpio — sin clamp parcial que genera ghost collisions
+    if (lx < 0.f || ly < 0.f || lz < 0.f ||
+        lx >= (float)(resX - 1) || ly >= (float)(resY - 1) || lz >= (float)(resZ - 1))
         return maxDist;
 
     int ix = (int)lx, iy = (int)ly, iz = (int)lz;
@@ -369,50 +360,77 @@ SMODS_API float SDF_Sample(
     float c10 = c010 + (c110 - c010) * fx;
     float c01 = c001 + (c101 - c001) * fx;
     float c11 = c011 + (c111 - c011) * fx;
-
-    float c0 = c00 + (c10 - c00) * fy;
-    float c1 = c01 + (c11 - c01) * fy;
-
+    float c0  = c00  + (c10  - c00)  * fy;
+    float c1  = c01  + (c11  - c01)  * fy;
     return c0 + (c1 - c0) * fz;
 }
 
+
 // ─── Batch SDF collision for cloth vertices ────────────────────
 SMODS_API void SDF_CollideVertices(
-    float*       pred,          // [n*3] in/out
-    const float* invMass,       // [n]
+    float*       pred,
+    const float* invMass,
     int          n,
     const float* sdfData,
     int resX, int resY, int resZ,
     float originX, float originY, float originZ,
     float invCellSize,
     float maxDist,
-    float thickness)
+    float thickness,
+    float gradientFactor)   // <-- parámetro nuevo (antes hardcodeado a 1.5)
 {
+    int rxy = resX * resY;
+    auto Idx = [&](int x, int y, int z) { return z * rxy + y * resX + x; };
+
     for (int i = 0; i < n; i++) {
         if (invMass[i] <= 0.0f) continue;
         int i3 = i * 3;
+        float wx = pred[i3], wy = pred[i3 + 1], wz = pred[i3 + 2];
 
-        float dist = SDF_Sample(sdfData, resX, resY, resZ,
-                                originX, originY, originZ, invCellSize, maxDist,
-                                pred[i3], pred[i3 + 1], pred[i3 + 2]);
+        float lx = (wx - originX) * invCellSize;
+        float ly = (wy - originY) * invCellSize;
+        float lz = (wz - originZ) * invCellSize;
+
+        if (lx < 0.f || ly < 0.f || lz < 0.f ||
+            lx >= (float)(resX - 1) || ly >= (float)(resY - 1) || lz >= (float)(resZ - 1))
+            continue;
+
+        int ix = (int)lx, iy = (int)ly, iz = (int)lz;
+        float fx = lx - ix, fy = ly - iy, fz = lz - iz;
+
+        // Leer los 8 voxels del cubo una sola vez
+        float c000 = sdfData[Idx(ix,   iy,   iz  )];
+        float c100 = sdfData[Idx(ix+1, iy,   iz  )];
+        float c010 = sdfData[Idx(ix,   iy+1, iz  )];
+        float c110 = sdfData[Idx(ix+1, iy+1, iz  )];
+        float c001 = sdfData[Idx(ix,   iy,   iz+1)];
+        float c101 = sdfData[Idx(ix+1, iy,   iz+1)];
+        float c011 = sdfData[Idx(ix,   iy+1, iz+1)];
+        float c111 = sdfData[Idx(ix+1, iy+1, iz+1)];
+
+        // Distancia trilinear
+        float c00  = c000 + (c100 - c000) * fx;
+        float c10  = c010 + (c110 - c010) * fx;
+        float c01  = c001 + (c101 - c001) * fx;
+        float c11  = c011 + (c111 - c011) * fx;
+        float c0   = c00  + (c10  - c00)  * fy;
+        float c1   = c01  + (c11  - c01)  * fy;
+        float dist = c0   + (c1   - c0)   * fz;
+
         if (dist >= thickness) continue;
 
-        // Gradient via central differences
-        float h = 1.0f / invCellSize * 1.5f; // gradientSampleFactor=1.5
-        float gdx = SDF_Sample(sdfData, resX, resY, resZ, originX, originY, originZ, invCellSize, maxDist,
-                               pred[i3] + h, pred[i3 + 1], pred[i3 + 2])
-                   - SDF_Sample(sdfData, resX, resY, resZ, originX, originY, originZ, invCellSize, maxDist,
-                               pred[i3] - h, pred[i3 + 1], pred[i3 + 2]);
-        float gdy = SDF_Sample(sdfData, resX, resY, resZ, originX, originY, originZ, invCellSize, maxDist,
-                               pred[i3], pred[i3 + 1] + h, pred[i3 + 2])
-                   - SDF_Sample(sdfData, resX, resY, resZ, originX, originY, originZ, invCellSize, maxDist,
-                               pred[i3], pred[i3 + 1] - h, pred[i3 + 2]);
-        float gdz = SDF_Sample(sdfData, resX, resY, resZ, originX, originY, originZ, invCellSize, maxDist,
-                               pred[i3], pred[i3 + 1], pred[i3 + 2] + h)
-                   - SDF_Sample(sdfData, resX, resY, resZ, originX, originY, originZ, invCellSize, maxDist,
-                               pred[i3], pred[i3 + 1], pred[i3 + 2] - h);
+        // Gradiente analítico del trilinear — sin samples adicionales, sin cruzar Voronoi
+        float gdx = invCellSize * (
+            (1.f-fy)*(1.f-fz)*(c100-c000) + fy*(1.f-fz)*(c110-c010) +
+            (1.f-fy)*     fz *(c101-c001) + fy*      fz *(c111-c011));
+        float gdy = invCellSize * (
+            (1.f-fx)*(1.f-fz)*(c010-c000) + fx*(1.f-fz)*(c110-c100) +
+            (1.f-fx)*     fz *(c011-c001) + fx*      fz *(c111-c101));
+        float gdz = invCellSize * (
+            (1.f-fx)*(1.f-fy)*(c001-c000) + fx*(1.f-fy)*(c101-c100) +
+            (1.f-fx)*     fy *(c011-c010) + fx*      fy *(c111-c110));
 
-        float gradLen = std::sqrt(gdx * gdx + gdy * gdy + gdz * gdz);
+        float gradLen = std::sqrt(gdx*gdx + gdy*gdy + gdz*gdz);
         float pushAmount = thickness - dist;
 
         if (gradLen > 1e-6f) {
@@ -421,20 +439,7 @@ SMODS_API void SDF_CollideVertices(
             pred[i3 + 1] += gdy * invGL * pushAmount;
             pred[i3 + 2] += gdz * invGL * pushAmount;
         } else {
-            // Zero gradient: near body centre. Use direction from SDF origin
-            // centre to the vertex as fallback push direction.
-            float toCx = pred[i3]     - (originX + (resX * 0.5f) / invCellSize);
-            float toCy = pred[i3 + 1] - (originY + (resY * 0.5f) / invCellSize);
-            float toCz = pred[i3 + 2] - (originZ + (resZ * 0.5f) / invCellSize);
-            float toLen = std::sqrt(toCx * toCx + toCy * toCy + toCz * toCz);
-            if (toLen > 1e-6f) {
-                float inv = pushAmount / toLen;
-                pred[i3]     += toCx * inv;
-                pred[i3 + 1] += toCy * inv;
-                pred[i3 + 2] += toCz * inv;
-            } else {
-                pred[i3 + 1] += pushAmount; // absolute fallback
-            }
+            pred[i3 + 1] += pushAmount;
         }
     }
 }

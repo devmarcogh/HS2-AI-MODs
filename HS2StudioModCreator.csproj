@@ -127,7 +127,6 @@
     <Compile Include="Core\Mods\Cloth\GPUSDFBuilder.cs" />
     <Compile Include="Core\Mods\Cloth\GPUClothSolver.cs" />
     <Compile Include="Core\Mods\Cloth\ComputeBundleLoader.cs" />
-    <Compile Include="Core\Mods\Cloth\SpatialHashGrid.cs" />
     <Compile Include="Core\Mods\NativeBridge.cs" />
     <Compile Include="Core\Framework\Modules\CharacterEditorModule.cs" />
     <Compile Include="Core\Mods\Modules\ClothPhysicsModule.cs" />
@@ -147,8 +146,31 @@
     <Compile Include="Properties\AssemblyInfo.cs" />
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
+  <Target Name="InstallPlugin" AfterTargets="Build">
+    <PropertyGroup>
+      <SourceDLL>$(TargetDir)HS2StudioCharaModsMSG.dll</SourceDLL>
+    </PropertyGroup>
+
+    <Message Text="[POST-BUILD] Intentando copiar desde: $(SourceDLL)" Importance="high" />
+    <Message Text="[POST-BUILD] Hacia destino: $(BepinExPluginsDir)" Importance="high" />
+
+    <Copy 
+      SourceFiles="$(SourceDLL)" 
+      DestinationFolder="$(BepinExPluginsDir)" 
+      SkipUnchangedFiles="false" 
+      Condition="Exists('$(SourceDLL)')"
+    />
+    
+    <Error Text="[POST-BUILD] No se encontro la DLL en la ruta de salida!" Condition="!Exists('$(SourceDLL)')" />
+  </Target>
+
   <PropertyGroup>
     <PostBuildEvent>
     </PostBuildEvent>
   </PropertyGroup>
+  <PropertyGroup>
+    <BepinExPluginsDir>D:\Documents\CAARP\BepinEx</BepinExPluginsDir>
+  </PropertyGroup>
+
+
 </Project>

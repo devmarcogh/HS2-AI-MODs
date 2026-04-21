@@ -2,40 +2,42 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "build",
+            "label": "build-managed-debug",
             "command": "dotnet",
             "type": "process",
             "args": [
-                "build",
+                "msbuild",
                 "${workspaceFolder}/StudioCharaEditor.sln",
-                "/property:GenerateFullPaths=true",
-                "/consoleloggerparameters:NoSummary;ForceNoAlign"
+                "/p:Configuration=Debug",
+                "/t:Build",
+                "/v:m"
             ],
             "problemMatcher": "$msCompile"
         },
         {
-            "label": "publish",
-            "command": "dotnet",
-            "type": "process",
+            "label": "install-native-debug",
+            "type": "shell",
+            "command": "cmake",
             "args": [
-                "publish",
-                "${workspaceFolder}/StudioCharaEditor.sln",
-                "/property:GenerateFullPaths=true",
-                "/consoleloggerparameters:NoSummary;ForceNoAlign"
+                "--build", "${workspaceFolder}/Native/build",
+                "--config", "Debug",
+                "--target", "install"
             ],
-            "problemMatcher": "$msCompile"
+            "problemMatcher": []
         },
         {
-            "label": "watch",
-            "command": "dotnet",
-            "type": "process",
-            "args": [
-                "watch",
-                "run",
-                "--project",
-                "${workspaceFolder}/StudioCharaEditor.sln"
+            "label": "Dev-Build-and-Deploy",
+            "dependsOn": [
+                "build-managed-debug",
+                "install-native-debug"
             ],
-            "problemMatcher": "$msCompile"
+            "dependsOrder": "parallel",
+            "type": "shell",
+            "command": "start \"\" \"D:/Documents/CAARP/StudioNEOV2.exe\"",
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            }
         }
     ]
 }

@@ -19,7 +19,7 @@ namespace StudioModsMSG
     ///      mirrored DynamicBone collider collision).
     ///   4. Derive velocity from position change, apply damping, commit positions.
     /// </summary>
-    [DefaultExecutionOrder(10000)] // Run after IK/FK mods so bone transforms are final
+    [DefaultExecutionOrder(99000)] // Run after IK/FK mods so bone transforms are final
     class ClothSoftBodyRuntime : MonoBehaviour
     {
 
@@ -42,6 +42,7 @@ namespace StudioModsMSG
         }
 
         // ── Optimisation: MirrorCollider flat array (avoid List enumerator in hot loop) ──
+
         private MirrorCollider[] _mirrorColArr = new MirrorCollider[64];
         private int              _mirrorColCount;
 
@@ -64,9 +65,6 @@ namespace StudioModsMSG
         // to avoid cross-mesh corruption when multiple meshes are active simultaneously.
         private Matrix4x4[] _skinMats;
 
-        // ── Optimisation: cloth-to-cloth spatial hash grid ─────────────────────────
-        private readonly SpatialHashGrid _clothGrid     = new SpatialHashGrid();
-        private readonly List<int>       _clothQueryBuf = new List<int>(64);
 
         // ── Optimisation: thread-local query buffer for parallel collision ───
 
@@ -138,8 +136,10 @@ namespace StudioModsMSG
 
         private void SyncFromNative(ClothMeshState s)
         {
-            int n = s.VertCount;
-            for (int i = 0; i < n; i++)
+            // Only read back FREE particles. Pinned and dummy-padding particles
+            // [FreeVertCount..VertCount-1] must NEVER be overwritten by the solver.
+            int freeN = s.FreeVertCount;
+            for (int i = 0; i < freeN; i++)
             {
                 int i3 = i * 3;
                 s.Position[i]     = new Vector3(_nPos[i3], _nPos[i3 + 1], _nPos[i3 + 2]);
@@ -191,6 +191,11 @@ namespace StudioModsMSG
         /// When true, the simulation is frozen — cloth stays in its current shape.
         /// </summary>
         public bool SimulationPaused { get; set; } = false;
+
+        /// <summary>
+        /// True when any mesh is being manually deformed (disables camera input).
+        /// </summary>
+        public static bool ManualDeformActive { get; set; } = false;
 
         private void EnsureMirrorCapacity(int needed)
         {
@@ -442,8 +447,6 @@ namespace StudioModsMSG
             // Start warmup: first N frames use heavy damping to let the cloth settle.
             state.WarmupFramesRemaining = ClothMeshState.WarmupDuration;
 
-            // Allocate trigger-cooldown array for ManualDeformation mode
-            EnsureTriggerCooldown(state);
 
             WriteMesh(state);
         }
@@ -452,37 +455,6 @@ namespace StudioModsMSG
         // Triggered-simulation helpers
         // ------------------------------------------------------------------ //
 
-        /// <summary>
-        /// Returns the closest point on a capsule segment to world-space point p.
-        /// Extracted from SolveVertexCollision so it can be reused in UpdateTriggerMasks.
-        /// </summary>
-        private static Vector3 GetCapsuleClosestPoint(Vector3 p, Vector3 p1, Vector3 v, float vDotV)
-        {
-            if (vDotV < 1e-10f) return p1;
-            float t = Mathf.Clamp01(Vector3.Dot(p - p1, v) / vDotV);
-            return p1 + t * v;
-        }
-
-        // ── Warm-up: allocate TriggerCooldown for ManualDeformation meshes ──
-        private void EnsureTriggerCooldown(ClothMeshState state)
-        {
-            int n = state.VertCount;
-            if (state.TriggerCooldown == null || state.TriggerCooldown.Length < n)
-                state.TriggerCooldown = new int[n];
-            else
-                Array.Clear(state.TriggerCooldown, 0, n);
-        }
-
-        /// <summary>
-        /// After all substeps, restore per-vertex InvMass for the next frame.
-        /// Only called after triggered-mode substeps where InvMass was temporarily zeroed.
-        /// </summary>
-        private static void RestoreInvMass(ClothMeshState s)
-        {
-            for (int i = 0; i < s.VertCount; i++)
-                if (!s.IsPinned[i] && s.Mass[i] > 0f)
-                    s.InvMass[i] = 1f / s.Mass[i];
-        }
         private void OnDisable()
         {
             // Deactivate all on component disable
@@ -525,7 +497,6 @@ namespace StudioModsMSG
             }
 
             // --- Manual Deformation: resolve cursor world position once per frame ---
-            UpdateManualDeformationInput();
 
             float dt = Mathf.Clamp(Time.deltaTime, 0.001f, 0.05f);
 
@@ -536,10 +507,6 @@ namespace StudioModsMSG
                 // Per-mesh pause: skip simulation but keep the mesh rendered as-is.
                 if (state.SimulationPaused) continue;
 
-                // ManualDeformation: update per-vertex wake masks BEFORE bone-follow
-                // and substeps.  Also temporarily zeros InvMass for sleeping vertices.
-                if (state.SimulationMode == ClothSimulationMode.ManualDeformation)
-                    UpdateManualDeformMasks(state);
 
                 // LBS skinning + per-vertex bone-follow using per-mesh cached buffers.
                 SkinAndFollowBones(state);
@@ -548,26 +515,41 @@ namespace StudioModsMSG
                 int   substeps = Mathf.Max(1, Mathf.RoundToInt(state.Params.Substeps));
                 float subDt    = dt / substeps;
 
-                // 3-tier fallback: GPU → Native → Managed
+                // 2-tier: GPU → Native (C++)
                 if (GPUClothAvailable)
                 {
                     SimulateAllSubstepsGPU(state, dt, substeps);
                 }
-                else
+                else if (NativeAvailable)
                 {
                     for (int sub = 0; sub < substeps; sub++)
-                        SimulateStep(state, subDt);
+                        SimulateStepNative(state, subDt);
                 }
 
-                // Restore per-vertex InvMass if manual-deform mode zeroed it
-                if (state.SimulationMode == ClothSimulationMode.ManualDeformation)
-                    RestoreInvMass(state);
 
                 // Blend zone: lerp simulated positions toward LBS for partially-pinned vertices
                 ApplyPinBlend(state);
 
+                // FINAL HARD LOCK: no matter what any solver path did, pinned vertices
+                // must always be at their exact LBS position before rendering.
+                // Indices [PadFreeCount..VertCount-1] are the pinned region.
+                if (state.SkinnedPositions != null && state.PadFreeCount > 0)
+                {
+                    int padFree = state.PadFreeCount;
+                    int total   = state.VertCount;
+                    for (int pi = padFree; pi < total; pi++)
+                    {
+                        state.Position[pi]     = state.SkinnedPositions[pi];
+                        state.PredPosition[pi] = state.SkinnedPositions[pi];
+                        state.Velocity[pi]     = Vector3.zero;
+                    }
+                }
+
                 if (state.Params.ClothToCloth)
-                    ApplyClothToClothCollision(state);
+                {
+                    // Managed cloth-to-cloth collision removed. 
+                    // Native/GPU paths should handle this if implemented there.
+                }
 
                 WriteMesh(state);
 
@@ -577,141 +559,8 @@ namespace StudioModsMSG
             }
         }
 
-        // ── Manual Deformation input (runs once per LateUpdate) ──────────────
-        // Resolves the world-space cursor position by raycasting the camera ray
-        // against the cloth mesh's AABB plane.  Stores the result in each
-        // ManualDeformation mesh so UpdateManualDeformMasks can use it.
-        private Vector3 _manualDeformCursorWorld;
-        private bool    _manualDeformActive;
 
-        /// <summary>True while the user holds the ManualDeform keybinding + RMB. Used by BaseUI to suppress camera control.</summary>
-        internal static bool ManualDeformActive { get; private set; }
 
-        private void UpdateManualDeformationInput()
-        {
-            // Check keybinding: modifier key(s) must be held AND right mouse button pressed.
-            bool keyHeld = StudioCharaEditor.KeyManualDeform != null &&
-                           IsManualDeformKeyHeld();
-            bool rmb     = Input.GetMouseButton(1);
-            _manualDeformActive  = keyHeld && rmb;
-            ManualDeformActive   = _manualDeformActive;
-
-            if (!_manualDeformActive)
-            {
-                // Clear drag state on all ManualDeform meshes so they auto-pause.
-                for (int i = 0; i < activeStates.Count; i++)
-                {
-                    ClothMeshState s = activeStates[i];
-                    if (s == null) continue;
-                    if (s.SimulationMode == ClothSimulationMode.ManualDeformation)
-                    {
-                        s.IsDragging      = false;
-                        s.DragVertexIndex = -1;
-                        s.SimulationPaused = true;
-                    }
-                }
-                return;
-            }
-
-            // Resolve cursor → world via camera ray against the Y=0 world plane
-            // (approximation; good enough for cloth that sits near body height).
-            Camera cam = Camera.main;
-            if (cam == null) return;
-
-            Ray ray = cam.ScreenPointToRay(Input.mousePosition);
-            // Intersect against a horizontal plane at the average height of all active meshes.
-            float planeY = 0f;
-            int   cnt    = 0;
-            for (int i = 0; i < activeStates.Count; i++)
-            {
-                ClothMeshState s = activeStates[i];
-                if (s == null || s.SimulationMode != ClothSimulationMode.ManualDeformation) continue;
-                planeY += s.WorldBounds.center.y;
-                cnt++;
-            }
-            if (cnt > 0) planeY /= cnt;
-
-            float denom = ray.direction.y;
-            if (Mathf.Abs(denom) > 1e-6f)
-            {
-                float t = (planeY - ray.origin.y) / denom;
-                if (t > 0f)
-                    _manualDeformCursorWorld = ray.origin + ray.direction * t;
-            }
-
-            // Activate all ManualDeformation meshes while key+RMB held.
-            for (int i = 0; i < activeStates.Count; i++)
-            {
-                ClothMeshState s = activeStates[i];
-                if (s == null || s.SimulationMode != ClothSimulationMode.ManualDeformation) continue;
-                s.SimulationPaused = false;
-                s.IsDragging       = true;
-                s.DragTargetWorld  = _manualDeformCursorWorld;
-
-                // Find the closest vertex to the cursor each frame (cheap linear scan).
-                float bestSq = float.MaxValue;
-                int   bestI  = -1;
-                for (int vi = 0; vi < s.VertCount; vi++)
-                {
-                    float sq = (s.Position[vi] - _manualDeformCursorWorld).sqrMagnitude;
-                    if (sq < bestSq) { bestSq = sq; bestI = vi; }
-                }
-                s.DragVertexIndex = bestI;
-            }
-        }
-
-        private static bool IsManualDeformKeyHeld()
-        {
-            KeyboardShortcut ks = StudioCharaEditor.KeyManualDeform.Value;
-            if (!Input.GetKey(ks.MainKey)) return false;
-            foreach (KeyCode mod in ks.Modifiers)
-                if (!Input.GetKey(mod)) return false;
-            return true;
-        }
-
-        /// <summary>
-        /// For ManualDeformation meshes: decay cooldown, wake vertices within
-        /// DeformRadius of the cursor (and attract the dragged vertex toward it),
-        /// zero InvMass for sleeping vertices.
-        /// </summary>
-        private void UpdateManualDeformMasks(ClothMeshState s)
-        {
-            if (s.SimulationMode != ClothSimulationMode.ManualDeformation) return;
-            if (s.TriggerCooldown == null || s.Mass == null) return;
-
-            int   n   = s.VertCount;
-            float rad = s.DeformRadius;
-
-            bool   dragging  = s.IsDragging && s.DragVertexIndex >= 0;
-            Vector3 cursor   = _manualDeformCursorWorld;
-            float   radSq    = rad * rad;
-
-            for (int i = 0; i < n; i++)
-            {
-                if (s.IsPinned[i]) continue;
-
-                // Decay cooldown
-                if (s.TriggerCooldown[i] > 0) s.TriggerCooldown[i]--;
-
-                // Wake vertices within DeformRadius of the cursor
-                if (dragging && (s.Position[i] - cursor).sqrMagnitude < radSq)
-                    s.TriggerCooldown[i] = ClothMeshState.TriggerCooldownFrames;
-
-                // Apply spring attraction to the dragged vertex and its neighbours
-                if (dragging && i == s.DragVertexIndex && s.TriggerCooldown[i] > 0)
-                {
-                    // Direct impulse: pull vertex toward cursor each frame
-                    Vector3 delta = cursor - s.Position[i];
-                    s.Velocity[i] += delta * 12f * Time.deltaTime; // spring constant
-                }
-
-                if (s.TriggerCooldown[i] == 0)
-                {
-                    s.InvMass[i]  = 0f;
-                    s.Velocity[i] = Vector3.zero;
-                }
-            }
-        }
 
         // ================================================================== //
         // xPBD substep  (Macklin et al. 2016 — Extended Position-Based Dynamics)
@@ -727,135 +576,6 @@ namespace StudioModsMSG
 
         private const float MaxCompressionRatio = 0.35f;
 
-        private void SimulateStep(ClothMeshState s, float dt)
-        {
-            int n = s.VertCount;
-
-            Array.Copy(s.Position, s.PrevPosition, n);
-
-            // ── Native fast path ──
-            if (NativeAvailable)
-            {
-                SimulateStepNative(s, dt);
-                return;
-            }
-
-            // 1. Predict (parallel when large enough)
-            // Note: triggered-frozen verts have InvMass=0 (set by UpdateTriggerMasks).
-            // Checking InvMass<=0 here covers both bone-pinned AND triggered-frozen verts.
-            float g = s.Params.Gravity * s.Params.Weight;
-            if (n > 128)
-            {
-                Vector3[] pos  = s.Position;
-                Vector3[] pred = s.PredPosition;
-                Vector3[] vel  = s.Velocity;
-                float[]   inv  = s.InvMass;
-                Parallel.For(0, n, i =>
-                {
-                    if (inv[i] <= 0f) { pred[i] = pos[i]; return; }
-                    Vector3 v = vel[i]; v.y += g * dt; vel[i] = v;
-                    pred[i] = pos[i] + v * dt;
-                });
-            }
-            else
-            {
-                for (int i = 0; i < n; i++)
-                {
-                    if (s.InvMass[i] <= 0f) { s.PredPosition[i] = s.Position[i]; continue; }
-                    s.Velocity[i].y += g * dt;
-                    s.PredPosition[i] = s.Position[i] + s.Velocity[i] * dt;
-                }
-            }
-
-            // 3. Constraints Iterations
-            float tildedCompliance = 1f / Mathf.Max(1e-6f, s.Params.StretchStiffness * dt * dt);
-            float bendCompliance   = 1f / Mathf.Max(1e-6f, s.Params.BendStiffness * dt * dt);
-            float thick = s.Params.Thickness;
-
-            // Snapshot collider array reference + count for thread safety (immutable during iteration)
-            MirrorCollider[] colArr = _mirrorColArr;
-            int              colCnt = _mirrorColCount;
-
-            // SDF collision state
-            bool useSDF = UseSDFColliders && _sdfProxy != null && _sdfProxy.IsReady;
-            SDFBodyCollider sdfCol = useSDF ? _sdfProxy : null;
-
-            int iterations = Mathf.Max(1, Mathf.RoundToInt(s.Params.Iterations));
-            for (int iter = 0; iter < iterations; iter++)
-            {
-                SolveEdges_XPBD(s, tildedCompliance);
-                if (s.BendPairs != null && s.BendPairs.Length > 0)
-                    SolveBends_XPBD(s, bendCompliance);
-            }
-
-            // Collision pass — ONCE per substep, after all constraint iterations.
-            // Skip frozen verts (InvMass=0 covers both bone-pinned and triggered-frozen).
-            if (n > 256)
-            {
-                float[] invC = s.InvMass;
-                Parallel.For(0, n, i =>
-                {
-                    if (invC[i] <= 0f) return;
-                    s.PredPosition[i] = SolveVertexCollision(
-                        s.PredPosition[i], colArr, colCnt, thick,
-                        useSDF, sdfCol);
-                });
-            }
-            else
-            {
-                for (int i = 0; i < n; i++)
-                {
-                    if (s.InvMass[i] <= 0f) continue;
-                    s.PredPosition[i] = SolveVertexCollision(
-                        s.PredPosition[i], colArr, colCnt, thick,
-                        useSDF, sdfCol);
-                }
-            }
-
-            // 4. Commit (parallel when large enough)
-            float inv_dt   = 1f / dt;
-            // During warmup, use extra-strong damping to let the cloth settle without
-            // explosion from sudden collider contact on the first frames.
-            float dampBase  = s.Params.Damping;
-            if (s.WarmupFramesRemaining > 0)
-                dampBase = Mathf.Lerp(dampBase, 30f,
-                    s.WarmupFramesRemaining / (float)ClothMeshState.WarmupDuration);
-            float damp     = Mathf.Clamp01(1f - dampBase * dt);
-            // During warmup, cap velocity even tighter.
-            float maxSpeed   = s.WarmupFramesRemaining > 0 ? 2f : 15f;
-            float maxSpeedSq = maxSpeed * maxSpeed;
-            // SDF surface friction: near the surface, cancel velocity pointing into the body.
-            // Prevents jitter from voxel-edge noise injecting chaotic momentum.
-            float frictionZone = thick * 2.5f;
-            if (n > 128)
-            {
-                Vector3[] pos  = s.Position;
-                Vector3[] pred = s.PredPosition;
-                Vector3[] vel  = s.Velocity;
-                float[]   invK = s.InvMass;
-                Parallel.For(0, n, i =>
-                {
-                    if (invK[i] <= 0f) return;  // pinned or triggered-frozen
-                    Vector3 v = (pred[i] - pos[i]) * inv_dt * damp;
-                    if (v.sqrMagnitude > maxSpeedSq) v = v.normalized * maxSpeed;
-                    v = StripInwardVelocity(v, pred[i], useSDF, sdfCol, frictionZone);
-                    vel[i] = v;
-                    pos[i] = pred[i];
-                });
-            }
-            else
-            {
-                for (int i = 0; i < n; i++)
-                {
-                    if (s.InvMass[i] <= 0f) continue;  // pinned or triggered-frozen
-                    Vector3 v = (s.PredPosition[i] - s.Position[i]) * inv_dt * damp;
-                    if (v.sqrMagnitude > maxSpeedSq) v = v.normalized * maxSpeed;
-                    v = StripInwardVelocity(v, s.PredPosition[i], useSDF, sdfCol, frictionZone);
-                    s.Velocity[i] = v;
-                    s.Position[i] = s.PredPosition[i];
-                }
-            }
-        }
 
         // ================================================================== //
         // GPU xPBD — all substeps on GPU, single upload/readback
@@ -893,7 +613,7 @@ namespace StudioModsMSG
 
             _gpuClothSolver.Simulate(
                 s.Position, s.Velocity, s.InvMass, s.IsPinned,
-                n,
+                n, s.PadFreeCount,
                 _nColliders, _mirrorColCount,
                 g, dt, substeps, iterations,
                 tildedCompliance, bendCompliance,
@@ -908,6 +628,20 @@ namespace StudioModsMSG
                 useSDF ? _sdfProxy.SDFResZ : 0,
                 useSDF ? _sdfProxy.SDFCellSize : 0f,
                 useSDF ? _sdfProxy.SDFMaxDist : 0f);
+
+            // HARD LOCK: GPU GetData may have overwritten pinned positions with
+            // whatever the compute shader stored. Force them back to exact LBS.
+            if (s.SkinnedPositions != null)
+            {
+                int padFree = s.PadFreeCount;
+                int total   = s.VertCount;
+                for (int i = padFree; i < total; i++)
+                {
+                    s.Position[i]     = s.SkinnedPositions[i];
+                    s.PredPosition[i] = s.SkinnedPositions[i];
+                    s.Velocity[i]     = Vector3.zero;
+                }
+            }
         }
 
         // ================================================================== //
@@ -915,29 +649,35 @@ namespace StudioModsMSG
         // ================================================================== //
         private void SimulateStepNative(ClothMeshState s, float dt)
         {
-            int n = s.VertCount;
+            int totalN = s.VertCount;
+            int freeN = s.PadFreeCount > 0 ? s.PadFreeCount : totalN;
             EnsureNativeBuffers(s);
             SyncToNative(s);
 
             // 1. Predict
             float g = s.Params.Gravity * s.Params.Weight;
-            NativeBridge.Cloth_Predict(_nPos, _nVel, _nPred, _nInvMass, n, g, dt);
+            NativeBridge.Cloth_Predict(_nPos, _nVel, _nPred, _nInvMass, freeN, g, dt);
 
-            // 2. Constraint iterations
+            // 2. Constraints + Collision dentro del loop
             float tildedCompliance = 1f / Mathf.Max(1e-6f, s.Params.StretchStiffness * dt * dt);
             float bendCompliance   = 1f / Mathf.Max(1e-6f, s.Params.BendStiffness * dt * dt);
             float thick = s.Params.Thickness;
+            bool useSDF = UseSDFColliders && _sdfProxy != null && _sdfProxy.IsReady;
 
             int iterations = Mathf.Max(1, Mathf.RoundToInt(s.Params.Iterations));
+
+            // Pre-construir colliders nativos UNA sola vez antes del loop
+            BuildNativeColliders();
+
             for (int iter = 0; iter < iterations; iter++)
             {
-                // Solve edges per color group (sequential between groups for correctness)
+                // Edges
                 if (s.EdgeColorGroups != null)
                 {
                     float pressScale = 1f - s.Params.Compression * MaxCompressionRatio;
                     foreach (int[] group in s.EdgeColorGroups)
                     {
-                        int[] groupEdges = new int[group.Length * 2];
+                        int[]   groupEdges   = new int[group.Length * 2];
                         float[] groupRestLen = new float[group.Length];
                         for (int gi = 0; gi < group.Length; gi++)
                         {
@@ -947,34 +687,31 @@ namespace StudioModsMSG
                             groupRestLen[gi]        = s.RestEdgeLen[eIdx];
                         }
                         NativeBridge.Cloth_SolveEdges(_nPred, _nInvMass, _nIsPinned,
-                            groupEdges, groupRestLen, group.Length,
-                            tildedCompliance, pressScale);
+                            groupEdges, groupRestLen, group.Length, tildedCompliance, pressScale);
                     }
                 }
                 else
                 {
-                    float[] restLen = s.RestEdgeLen;
                     float pressScale = 1f - s.Params.Compression * MaxCompressionRatio;
                     NativeBridge.Cloth_SolveEdges(_nPred, _nInvMass, _nIsPinned,
-                        s.Edges, restLen, s.Edges.Length / 2,
-                        tildedCompliance, pressScale);
+                        s.Edges, s.RestEdgeLen, s.Edges.Length / 2, tildedCompliance, pressScale);
                 }
 
-                // Solve bends per color group
+                // Bends
                 if (s.BendPairs != null && s.BendPairs.Length > 0)
                 {
                     if (s.BendColorGroups != null)
                     {
                         foreach (int[] group in s.BendColorGroups)
                         {
-                            int[] groupBends = new int[group.Length * 2];
+                            int[]   groupBends      = new int[group.Length * 2];
                             float[] groupRestBendLen = new float[group.Length];
                             for (int gi = 0; gi < group.Length; gi++)
                             {
                                 int bIdx = group[gi];
-                                groupBends[gi * 2]      = s.BendPairs[bIdx * 2];
-                                groupBends[gi * 2 + 1]  = s.BendPairs[bIdx * 2 + 1];
-                                groupRestBendLen[gi]     = s.RestBendLen[bIdx];
+                                groupBends[gi * 2]     = s.BendPairs[bIdx * 2];
+                                groupBends[gi * 2 + 1] = s.BendPairs[bIdx * 2 + 1];
+                                groupRestBendLen[gi]    = s.RestBendLen[bIdx];
                             }
                             NativeBridge.Cloth_SolveBends(_nPred, _nInvMass, _nIsPinned,
                                 groupBends, groupRestBendLen, group.Length, bendCompliance);
@@ -986,36 +723,27 @@ namespace StudioModsMSG
                             s.BendPairs, s.RestBendLen, s.BendPairs.Length / 2, bendCompliance);
                     }
                 }
-            }
 
-            // 3. Collision pass — capsule/sphere colliders
-            BuildNativeColliders();
-            if (_mirrorColCount > 0)
-                NativeBridge.Cloth_SolveCollision(_nPred, _nInvMass, n, _nColliders, _mirrorColCount, thick);
+                // Collision cápsulas (native)
+                if (_mirrorColCount > 0)
+                    NativeBridge.Cloth_SolveCollision(
+                        _nPred, _nInvMass, freeN, _nColliders, _mirrorColCount, thick);
 
-            // SDF collision pass (stays managed for now — SDF data lives in SDFBodyCollider)
-            bool useSDF = UseSDFColliders && _sdfProxy != null && _sdfProxy.IsReady;
-            if (useSDF)
-            {
-                // Write pred back to managed for SDF, then re-read
-                NativeBridge.FlatToVec3Array(_nPred, s.PredPosition, n);
-                for (int i = 0; i < n; i++)
+                // Collision SDF (native)
+                if (useSDF)
                 {
-                    if (s.InvMass[i] <= 0f) continue;
-                    s.PredPosition[i] = SolveVertexCollision(
-                        s.PredPosition[i], _mirrorColArr, 0, thick, true, _sdfProxy);
-                }
-                for (int i = 0; i < n; i++)
-                {
-                    int i3 = i * 3;
-                    _nPred[i3] = s.PredPosition[i].x;
-                    _nPred[i3 + 1] = s.PredPosition[i].y;
-                    _nPred[i3 + 2] = s.PredPosition[i].z;
+                    NativeBridge.SDF_CollideVertices(
+                        _nPred, _nInvMass, freeN, 
+                        _sdfProxy.GetSDFDataInternal(),
+                        _sdfProxy.SDFResX, _sdfProxy.SDFResY, _sdfProxy.SDFResZ,
+                        _sdfProxy.SDFOriginX, _sdfProxy.SDFOriginY, _sdfProxy.SDFOriginZ,
+                        1f / _sdfProxy.SDFCellSize, _sdfProxy.SDFMaxDist,
+                        thick, 1.0f);
                 }
             }
 
-            // 4. Commit
-            float inv_dt = 1f / dt;
+            // 3. Commit
+            float inv_dt   = 1f / dt;
             float dampBase = s.Params.Damping;
             if (s.WarmupFramesRemaining > 0)
                 dampBase = Mathf.Lerp(dampBase, 30f,
@@ -1023,301 +751,37 @@ namespace StudioModsMSG
             float damp     = Mathf.Clamp01(1f - dampBase * dt);
             float maxSpeed = s.WarmupFramesRemaining > 0 ? 2f : 15f;
 
-            NativeBridge.Cloth_Commit(_nPos, _nVel, _nPred, _nInvMass, n, inv_dt, damp, maxSpeed);
-
-            // Sync back to managed arrays
+            NativeBridge.Cloth_Commit(_nPos, _nVel, _nPred, _nInvMass, freeN, inv_dt, damp, maxSpeed);
             SyncFromNative(s);
-        }
 
-        /// <summary>
-        /// Pure function: resolve collisions and magnetic interactions for a single vertex.
-        /// Thread-safe — no shared mutable state.
-        /// MagneticMode: 0=Repel (normal push-out), 1=Attract (pull toward surface), 2=Off.
-        /// </summary>
-        private static Vector3 SolveVertexCollision(
-            Vector3 p, MirrorCollider[] colArr, int colCnt, float thick,
-            bool useSDF, SDFBodyCollider sdfCol)
-        {
-            // Mirror / proxy collider pass
-            for (int c = 0; c < colCnt; c++)
-            {
-                MirrorCollider col = colArr[c];
-
-                // Closest point on the collider primitive
-                Vector3 closest;
-                if (!col.IsCapsule)
-                {
-                    closest = col.Center;
-                }
-                else
-                {
-                    Vector3 w = p - col.P1;
-                    float t = Mathf.Clamp01(Vector3.Dot(w, col.V) / col.VDotV);
-                    closest = col.P1 + t * col.V;
-                }
-
-                Vector3 delta  = p - closest;
-                float   distSq = delta.sqrMagnitude;
-                float   dist   = Mathf.Sqrt(distSq);
-                float   minSep = col.Radius + thick;
-                Vector3 normal = (dist > 1e-6f) ? (delta / dist) : Vector3.up;
-
-                switch (col.MagneticMode)
-                {
-                    case 1: // Attract — pull cloth toward (and cling to) the collider surface.
-                    {
-                        // Any vertex within MagneticRange is snapped toward the surface.
-                        // MagneticStrength (0→1) is the per-substep blend fraction:
-                        //   1.0 = instant full snap, 0.5 = gentle pull over several frames.
-                        // Vertices that have already penetrated are always fully pushed out.
-                        float range = col.MagneticRange;
-                        if (dist < range)
-                        {
-                            Vector3 onSurface = closest + normal * minSep;
-                            float   blend     = dist < minSep
-                                ? 1f                                       // inside: full push-out
-                                : Mathf.Clamp01(col.MagneticStrength);    // outside: strength-controlled pull
-                            p = Vector3.Lerp(p, onSurface, blend);
-                        }
-                        break;
-                    }
-                    case 0: // Repel — default collision (push out when penetrating)
-                    default:
-                    {
-                        if (distSq < minSep * minSep)
-                            p = closest + normal * minSep;
-                        break;
-                    }
-                    // case 2 (Off): skipped entirely by UpdateMirrorColliders
-                }
-            }
-
-            // SDF collision — O(1) trilinear interpolation + gradient push
-            if (useSDF && sdfCol != null)
-            {
-                Unity.Mathematics.float3 fp = new Unity.Mathematics.float3(p.x, p.y, p.z);
-                float dist = sdfCol.SampleDistance(fp);
-                if (dist < thick)
-                {
-                    Unity.Mathematics.float3 grad = sdfCol.SampleGradient(fp);
-                    float gradLen = Unity.Mathematics.math.length(grad);
-                    float pushAmount = thick - dist;
-
-                    if (gradLen > 1e-6f)
-                    {
-                        Unity.Mathematics.float3 normal = grad / gradLen;
-                        Unity.Mathematics.float3 push = normal * pushAmount;
-                        p.x += push.x;
-                        p.y += push.y;
-                        p.z += push.z;
-                    }
-                    else
-                    {
-                        p.y += pushAmount; // fallback: push up
-                    }
-                }
-            }
-
-            return p;
-        }
-
-        /// <summary>
-        /// Removes the velocity component pointing into the SDF body surface.
-        /// Near the surface, voxel-edge noise injects chaotic push directions each frame;
-        /// letting those push vectors become velocity causes bounce/jitter.
-        /// Cancelling the inward-normal component keeps tangential sliding while
-        /// preventing energy injection from the collision response.
-        /// Thread-safe — only reads the SDF.
-        /// </summary>
-        private static Vector3 StripInwardVelocity(
-            Vector3 v, Vector3 pos,
-            bool useSDF, SDFBodyCollider sdfCol, float frictionZone)
-        {
-            if (!useSDF || sdfCol == null) return v;
-
-            Unity.Mathematics.float3 fp = new Unity.Mathematics.float3(pos.x, pos.y, pos.z);
-            float dist = sdfCol.SampleDistance(fp);
-
-            // Only apply friction near the surface (inside the friction zone)
-            if (dist >= frictionZone) return v;
-
-            Unity.Mathematics.float3 grad = sdfCol.SampleGradient(fp);
-            float gradLen = Unity.Mathematics.math.length(grad);
-            if (gradLen < 1e-6f) return v;
-
-            // Surface normal (pointing outward from body)
-            Unity.Mathematics.float3 normal = grad / gradLen;
-            Vector3 n = new Vector3(normal.x, normal.y, normal.z);
-
-            // Project velocity onto normal
-            float vn = Vector3.Dot(v, n);
-
-            // Only strip the component pointing INTO the surface (vn < 0)
-            if (vn >= 0f) return v;
-
-            // Blend: full stripping at surface, fading to zero at frictionZone
-            float blend = 1f - Mathf.Clamp01(dist / frictionZone);
-            return v - n * (vn * blend);
-        }
-
-        // MaxCompressionRatio: at Compression=1 edges target 65% of rest length.
-        // Keeping it below 50% avoids degeneracy while giving meaningful press-against-body effect.
-
-        private static void SolveEdges_XPBD(ClothMeshState s, float tildedCompliance)
-        {
-            float pressScale = 1f - s.Params.Compression * MaxCompressionRatio;
-
-            // Use graph-color groups when available (enables safe Parallel.For per color)
-            if (s.EdgeColorGroups != null && s.EdgeColorGroups.Length > 0)
-            {
-                for (int c = 0; c < s.EdgeColorGroups.Length; c++)
-                {
-                    int[] group = s.EdgeColorGroups[c];
-                    // Each group contains flat [pairIndex, pairIndex, ...] indices into Edges/RestEdgeLen
-                    if (group.Length > 64)
-                    {
-                        Parallel.For(0, group.Length, gi =>
-                            SolveEdgePair(s, group[gi], tildedCompliance, pressScale));
-                    }
-                    else
-                    {
-                        for (int gi = 0; gi < group.Length; gi++)
-                            SolveEdgePair(s, group[gi], tildedCompliance, pressScale);
-                    }
-                }
-            }
-            else
-            {
-                // Fallback: sequential (no color groups built yet)
-                for (int e = 0; e < s.Edges.Length; e += 2)
-                    SolveEdgePairDirect(s, e, tildedCompliance, pressScale);
-            }
-        }
-
-        private static void SolveEdgePair(ClothMeshState s, int pairIdx, float tc, float ps)
-            => SolveEdgePairDirect(s, pairIdx * 2, tc, ps);
-
-        private static void SolveEdgePairDirect(ClothMeshState s, int e, float tildedCompliance, float pressScale)
-        {
-            int i = s.Edges[e], j = s.Edges[e + 1];
-            float wi = s.IsPinned[i] ? 0f : s.InvMass[i];
-            float wj = s.IsPinned[j] ? 0f : s.InvMass[j];
-            if (wi == 0f && wj == 0f) return;
-            float wSum = wi + wj + tildedCompliance;
-            if (wSum < 1e-10f) return;
-            Vector3 d   = s.PredPosition[i] - s.PredPosition[j];
-            float   len = d.magnitude;
-            if (len < 1e-7f) return;
-            float   C      = len - s.RestEdgeLen[e / 2] * pressScale;
-            float   lambda = -C / wSum;
-            Vector3 corr   = (d / len) * lambda;
-            if (!s.IsPinned[i]) s.PredPosition[i] += wi * corr;
-            if (!s.IsPinned[j]) s.PredPosition[j] -= wj * corr;
-        }
-
-        private static void SolveBends_XPBD(ClothMeshState s, float tildedCompliance)
-        {
-            if (s.BendColorGroups != null && s.BendColorGroups.Length > 0)
-            {
-                for (int c = 0; c < s.BendColorGroups.Length; c++)
-                {
-                    int[] group = s.BendColorGroups[c];
-                    if (group.Length > 64)
-                    {
-                        Parallel.For(0, group.Length, gi =>
-                            SolveBendPairDirect(s, group[gi] * 2, tildedCompliance));
-                    }
-                    else
-                    {
-                        for (int gi = 0; gi < group.Length; gi++)
-                            SolveBendPairDirect(s, group[gi] * 2, tildedCompliance);
-                    }
-                }
-            }
-            else
-            {
-                for (int b = 0; b < s.BendPairs.Length; b += 2)
-                    SolveBendPairDirect(s, b, tildedCompliance);
-            }
-        }
-
-        private static void SolveBendPairDirect(ClothMeshState s, int b, float tildedCompliance)
-        {
-            int i = s.BendPairs[b], j = s.BendPairs[b + 1];
-            float wi = s.IsPinned[i] ? 0f : s.InvMass[i];
-            float wj = s.IsPinned[j] ? 0f : s.InvMass[j];
-            if (wi == 0f && wj == 0f) return;
-            float wSum = wi + wj + tildedCompliance;
-            if (wSum < 1e-10f) return;
-            Vector3 d   = s.PredPosition[i] - s.PredPosition[j];
-            float   len = d.magnitude;
-            if (len < 1e-7f) return;
-            float   C      = len - s.RestBendLen[b / 2];
-            float   lambda = -C / wSum;
-            Vector3 corr   = (d / len) * lambda;
-            if (!s.IsPinned[i]) s.PredPosition[i] += wi * corr;
-            if (!s.IsPinned[j]) s.PredPosition[j] -= wj * corr;
-        }
-
-        private void ApplyClothToClothCollision(ClothMeshState s)
-        {
-            float twoT   = s.Params.Thickness * 2f;
-            float twoTSq = twoT * twoT;
-
-            foreach (ClothMeshState other in activeStates)
-            {
-                if (other == s || !other.Params.ClothToCloth) continue;
-                if (!s.WorldBounds.Intersects(other.WorldBounds)) continue;
-
-                // Build spatial hash from the other mesh's positions for O(n+m) collision
-                _clothGrid.Build(other.Position, twoT);
-
-                for (int i = 0; i < s.VertCount; i++)
-                {
-                    if (s.IsPinned[i]) continue;
-                    Vector3 pi = s.Position[i];
-
-                    _clothGrid.Query(pi, twoT, _clothQueryBuf);
-                    for (int qi = 0; qi < _clothQueryBuf.Count; qi++)
-                    {
-                        int j = _clothQueryBuf[qi];
-                        if (other.IsPinned[j]) continue;
-                        Vector3 d   = pi - other.Position[j];
-                        float   dSq = d.sqrMagnitude;
-                        if (dSq >= twoTSq || dSq < 1e-10f) continue;
-
-                        float   dist  = Mathf.Sqrt(dSq);
-                        float   pen   = twoT - dist;
-                        Vector3 n     = d / dist;
-                        Vector3 push  = n * (pen * 0.5f);
-
-                        s.Position[i]     += push;
-                        other.Position[j] -= push;
-                    }
-                }
-            }
         }
         private void WriteMesh(ClothMeshState s)
         {
-            if (s.WorkMesh == null || s.Filter == null || s.LocalVerts == null) return;
+            if (s.WorkMesh == null || s.Filter == null || s.LocalVerts == null || s.VisualToSimMap == null) return;
 
-            // Cache worldToLocalMatrix to avoid per-vertex virtual call overhead
             Transform tf  = s.Renderer != null ? s.Renderer.transform : transform;
             Matrix4x4 w2l = tf.worldToLocalMatrix;
-            int       vc  = s.VertCount;
-            if (vc > 256)
+            int       origVc  = s.OriginalVertCount;
+            Vector3[] pos  = s.Position;
+            Vector3[] lv   = s.LocalVerts;
+
+            if (origVc > 512)
             {
-                Vector3[] pos  = s.Position;
-                Vector3[] lv   = s.LocalVerts;
-                Parallel.For(0, vc, i => { lv[i] = w2l.MultiplyPoint3x4(pos[i]); });
+                Parallel.For(0, origVc, i => { 
+                    int simIdx = s.VisualToSimMap[i];
+                    lv[i] = w2l.MultiplyPoint3x4(pos[simIdx]); 
+                });
             }
             else
             {
-                for (int i = 0; i < vc; i++)
-                    s.LocalVerts[i] = w2l.MultiplyPoint3x4(s.Position[i]);
+                for (int i = 0; i < origVc; i++)
+                {
+                    int simIdx = s.VisualToSimMap[i];
+                    lv[i] = w2l.MultiplyPoint3x4(pos[simIdx]);
+                }
             }
 
-            s.WorkMesh.vertices = s.LocalVerts;
+            s.WorkMesh.vertices = lv;
             s.WorkMesh.RecalculateBounds();   // CRITICAL: without this Unity frustum-culls the mesh
             s.WorkMesh.RecalculateNormals();
 
@@ -1337,20 +801,23 @@ namespace StudioModsMSG
 
         /// <summary>
         /// Per-frame LBS skinning for ALL vertices + per-vertex bone-follow.
-        /// Uses per-mesh SkinnedPositions / PrevSkinnedPositions buffers so that
-        /// multiple active cloth meshes cannot corrupt each other's bone-follow data.
-        /// 1. Compute LBS skinned positions for every vertex from current bone transforms.
-        /// 2. For non-pinned verts: shift Position/PrevPosition by the per-vertex delta
-        ///    between this frame's LBS and last frame's LBS, capturing IK/FK rotations
-        ///    and all bone motion.
-        /// 3. For fully-pinned verts: set Position directly to LBS output.
+        /// Layout contract (post-SetupMeshState):
+        ///   [0 .. FreeVertCount-1]   = free simulated particles
+        ///   [FreeVertCount .. PadFreeCount-1] = dummy padding (InvMass=0, skip)
+        ///   [PadFreeCount .. VertCount-1]     = PINNED particles (never simulated)
+        /// This function:
+        ///   1. Computes LBS for every particle into SkinnedPositions.
+        ///   2. IMMEDIATELY hard-locks pinned positions to LBS (before any solver runs).
+        ///   3. Applies bone-follow delta only to free particles.
         /// </summary>
         private void SkinAndFollowBones(ClothMeshState s)
         {
             if (s.SrcBindVerts == null || s.BindPoses == null ||
                 s.SkinBones == null || s.VertexBoneWeights == null) return;
 
-            int n = s.VertCount;
+            int n         = s.VertCount;
+            int freeN     = s.FreeVertCount > 0 ? s.FreeVertCount : n;
+            int padFreeN  = s.PadFreeCount  > 0 ? s.PadFreeCount  : n;
             int boneCount = s.SkinBones.Length;
 
             // Ensure per-mesh LBS caches are allocated
@@ -1361,8 +828,7 @@ namespace StudioModsMSG
 
             bool hasPrev = true; // buffers are always primed by WarmUpClothState
 
-            // Build bone matrices once per frame (shared scratch buffer is safe here
-            // because SkinAndFollowBones is called sequentially per mesh in LateUpdate)
+            // Build bone matrices once per frame
             if (_skinMats == null || _skinMats.Length < boneCount)
                 _skinMats = new Matrix4x4[boneCount];
             for (int b = 0; b < boneCount; b++)
@@ -1389,17 +855,21 @@ namespace StudioModsMSG
 
                 curr[i] = skinned;
 
-                if (s.IsPinned[i])
+                bool isDummy  = (i >= freeN  && i < padFreeN);
+                bool isPinned = (i >= padFreeN);  // pinned region starts at PadFreeCount
+
+                if (isPinned)
                 {
-                    // Fully pinned: set position directly to LBS
+                    // HARD LOCK: set directly to LBS — solver never touches these indices,
+                    // but we set all three buffers so WriteMesh always gets the right value.
                     s.Position[i]     = skinned;
                     s.PredPosition[i] = skinned;
                     s.Velocity[i]     = Vector3.zero;
                 }
-                else if (hasPrev && s.InvMass[i] > 0f)
+                else if (!isDummy && hasPrev && s.InvMass[i] > 0f)
                 {
-                    // Per-vertex bone-follow: shift by the delta between frames.
-                    // Skip when InvMass=0 (triggered-frozen) — those verts stay frozen.
+                    // Free particle bone-follow: advect by LBS delta so the cloth
+                    // moves with the character skeleton.
                     Vector3 delta = skinned - prev[i];
                     if (delta.sqrMagnitude > 1e-12f)
                     {
@@ -1407,7 +877,7 @@ namespace StudioModsMSG
                         s.PrevPosition[i] += delta;
                     }
                 }
-                // else: triggered-frozen (InvMass=0, not IsPinned) — position intentionally unchanged.
+                // dummy-padding and InvMass=0-frozen: intentionally unchanged.
             }
 
             // Rotate buffers: current frame becomes previous for next frame
@@ -1416,12 +886,13 @@ namespace StudioModsMSG
 
         /// <summary>
         /// After simulation: blend partially-pinned vertices toward their LBS position.
-        /// Fully-pinned verts already set by SkinAndFollowBones; fully-simulated verts untouched.
+        /// Only operates on FREE particles (indices 0..FreeVertCount-1).
         /// </summary>
         private void ApplyPinBlend(ClothMeshState s)
         {
             if (s.SkinnedPositions == null || s.PinBlend == null) return;
-            for (int i = 0; i < s.VertCount; i++)
+            int freeN = s.FreeVertCount > 0 ? s.FreeVertCount : s.VertCount;
+            for (int i = 0; i < freeN; i++)
             {
                 if (s.IsPinned[i]) continue;
 
@@ -1504,7 +975,6 @@ namespace StudioModsMSG
             }
 
             // Correct SrcBindVerts so that LBS(correctedVert) == current Position.
-            // This compensates for RestInflate, sim drift, and any BakeMesh/LBS mismatch.
             // Run once at pin time — SkinPinnedVertices then uses the corrected verts each frame.
             if (state.SrcBindVerts != null && state.BindPoses != null && state.SkinBones != null)
             {
@@ -1607,149 +1077,173 @@ namespace StudioModsMSG
 
             Mesh src = smr.sharedMesh;
 
-            // Clone rest-pose mesh (BakeMesh gives skinned local-space positions)
             Mesh baked = new Mesh();
             smr.BakeMesh(baked);
             baked.name = src.name + "_ClothPhysics";
 
             state.WorkMesh = baked;
-            state.VertCount = baked.vertices.Length;
-            state.WorkMesh.MarkDynamic(); // tells Unity this mesh is updated every frame → faster GPU upload
-            int originalVertCount = state.VertCount;
+            state.WorkMesh.MarkDynamic(); 
+            int originalVertCount = baked.vertices.Length;
+            state.OriginalVertCount = originalVertCount;
 
             Transform tf       = smr.transform;
             Vector3[] bakedV   = baked.vertices;
-            int[]     tris     = baked.triangles;
-            state.Tris = tris;
-
-            Vector3[] worldRest = new Vector3[state.VertCount];
-            for (int i = 0; i < state.VertCount; i++)
-                worldRest[i] = tf.TransformPoint(bakedV[i]);
-            state.Position     = new Vector3[state.VertCount];
-            state.Velocity     = new Vector3[state.VertCount];
-            state.PredPosition = new Vector3[state.VertCount];
-            state.PrevPosition = new Vector3[state.VertCount];
-            state.IsPinned     = new bool[state.VertCount];
-            state.Mass         = new float[state.VertCount];
-            state.InvMass      = new float[state.VertCount];
-
-            Array.Copy(worldRest, state.Position, state.VertCount);
-            int[] newToOriginalMap;
-            int[] vertexMapping = WeldVertices(state.Position, tris, 0.0001f);
-            int weldedCount = 0;
-
-            
-            for (int i = 0; i < vertexMapping.Length; i++)
-                if (vertexMapping[i] == i) weldedCount++;
-
-
-            Vector2[] originalUvs = src.uv;
-            Vector2[] weldedUvs = new Vector2[weldedCount];
-
-
-            if (weldedCount < state.VertCount)
-            {
-                // Build a separate mapping: original index → final compacted index
-                int[] originalToNewMap = new int[state.VertCount];
-                int idx = 0;
-                for (int i = 0; i < state.VertCount; i++)
-                {
-                    if (vertexMapping[i] == i){
-                        if (originalUvs != null && i < originalUvs.Length)
-                            weldedUvs[idx] = originalUvs[i];
-                        originalToNewMap[i] = idx++;  // kept vertex gets new index
-                    }
-                    else
-                        originalToNewMap[i] = -1;  // merged away
-                }
-
-                // Apply vertexMapping transitively to handle multi-level merges
-                for (int i = 0; i < vertexMapping.Length; i++)
-                {
-                    if (vertexMapping[i] != i)
-                    {
-                        int rep = vertexMapping[i];
-                        while (vertexMapping[rep] != rep)
-                            rep = vertexMapping[rep];
-                        vertexMapping[i] = rep;
-                    }
-                }
-                Vector3[] weldedPos = new Vector3[weldedCount];
-                bool[]    weldedPin = new bool[weldedCount];
-                newToOriginalMap = new int[weldedCount];
-                idx = 0;
-                for (int i = 0; i < state.VertCount; i++)
-                {
-                    if (vertexMapping[i] == i)
-                    {
-                        weldedPos[idx]   = state.Position[i];
-                        weldedPin[idx]   = state.IsPinned[i];
-                        newToOriginalMap[idx] = i;
-                        idx++;
-                    }
-                }
-
-                state.Position  = weldedPos;
-                state.IsPinned  = weldedPin;
-                state.VertCount = weldedCount;
-                worldRest       = weldedPos;
-
-                for (int i = 0; i < tris.Length; i++)
-                {
-                    int oldIdx = tris[i];
-                    int repIdx = vertexMapping[oldIdx];  // find representative
-                    tris[i] = originalToNewMap[repIdx];  // convert to new compacted index
-                }
-
-                tris = FilterValidTriangles(tris, weldedCount);
-
-                state.Tris = tris;
-
-                state.Velocity     = new Vector3[weldedCount];
-                state.PredPosition = new Vector3[weldedCount];
-                state.PrevPosition = new Vector3[weldedCount];
-                state.Mass         = new float[weldedCount];
-                state.InvMass      = new float[weldedCount];
-            }
-            else
-            {
-                newToOriginalMap = new int[originalVertCount];
-                for (int i = 0; i < originalVertCount; i++)
-                    newToOriginalMap[i] = i;
-                tris = FilterValidTriangles(tris, state.VertCount);
-                state.Tris = tris;
-            }
-
-            state.WorkMesh.Clear();
-
-            // ── Set up bone weights and skin bones BEFORE building WorkMesh ──
-            // We need these to re-skin positions via manual LBS, since BakeMesh may
-            // return bind/stale pose if the SMR hasn't been updated this frame.
-            BoneWeight[] srcBoneWeights = src.boneWeights;
-            state.VertexBoneWeights = new BoneWeight[state.VertCount];
-            for (int i = 0; i < state.VertCount; i++)
-            {
-                int srcIdx = newToOriginalMap[i];
-                if (srcBoneWeights != null && srcIdx >= 0 && srcIdx < srcBoneWeights.Length)
-                    state.VertexBoneWeights[i] = srcBoneWeights[srcIdx];
-                else
-                    state.VertexBoneWeights[i] = default(BoneWeight);
-            }
-            state.SkinBones = smr.bones;
-
-            // ── Store bind-pose data for per-frame LBS skinning of pinned vertices ──
+            int[]     srcTris  = baked.triangles;
+            state.SkinBones    = smr.bones;
             Matrix4x4[] bindPoses = src.bindposes;
             Vector3[]   srcVerts  = src.vertices;
-            state.BindPoses = bindPoses;
-            state.SrcBindVerts = new Vector3[state.VertCount];
-            for (int i = 0; i < state.VertCount; i++)
-            {
-                int origIdx = newToOriginalMap[i];
-                if (srcVerts != null && origIdx >= 0 && origIdx < srcVerts.Length)
-                    state.SrcBindVerts[i] = srcVerts[origIdx];
-            }
+            BoneWeight[] srcBoneWeights = src.boneWeights;
 
-            // ── Manual LBS: guarantee state.Position matches current animation pose ──
+            // 1. Initial Welding / Decimation
+            Vector3[] worldBaked = new Vector3[originalVertCount];
+            for (int i = 0; i < originalVertCount; i++) worldBaked[i] = tf.TransformPoint(bakedV[i]);
+            
+            int[] vertexMapping = WeldVertices(worldBaked, srcTris, state.Params.DecimationThreshold);
+            
+            List<int> uniqueOrigIndices = new List<int>();
+            int[] origToUnique = new int[originalVertCount];
+            for (int i = 0; i < originalVertCount; i++)
+            {
+                if (vertexMapping[i] == i)
+                {
+                    origToUnique[i] = uniqueOrigIndices.Count;
+                    uniqueOrigIndices.Add(i);
+                }
+                else origToUnique[i] = -1;
+            }
+            
+            for (int i = 0; i < originalVertCount; i++)
+            {
+                int rep = vertexMapping[i];
+                while (vertexMapping[rep] != rep) rep = vertexMapping[rep];
+                origToUnique[i] = origToUnique[rep];
+            }
+            
+            int uniqueCount = uniqueOrigIndices.Count;
+            
+            // 2. Identify Pinned Particles
+            bool[] uniqueIsPinned = new bool[uniqueCount];
+            if (state.PinSourceBoneNames != null && state.PinSourceBoneNames.Count > 0 && state.SkinBones != null && srcBoneWeights != null)
+            {
+                var selectedBoneIndices = new System.Collections.Generic.HashSet<int>();
+                for (int b = 0; b < state.SkinBones.Length; b++)
+                {
+                    Transform bone = state.SkinBones[b];
+                    if (bone == null) continue;
+                    for (int sbi = 0; sbi < state.PinSourceBoneNames.Count; sbi++)
+                    {
+                        if (string.Equals(bone.name, state.PinSourceBoneNames[sbi], StringComparison.OrdinalIgnoreCase))
+                        {
+                            selectedBoneIndices.Add(b); break;
+                        }
+                    }
+                }
+
+                if (selectedBoneIndices.Count > 0)
+                {
+                    for (int i = 0; i < uniqueCount; i++)
+                    {
+                        int origIdx = uniqueOrigIndices[i];
+                        if (origIdx >= srcBoneWeights.Length) continue;
+                        BoneWeight bw = srcBoneWeights[origIdx];
+                        float blend = 0f;
+                        if (selectedBoneIndices.Contains(bw.boneIndex0)) blend += bw.weight0;
+                        if (selectedBoneIndices.Contains(bw.boneIndex1)) blend += bw.weight1;
+                        if (selectedBoneIndices.Contains(bw.boneIndex2)) blend += bw.weight2;
+                        if (selectedBoneIndices.Contains(bw.boneIndex3)) blend += bw.weight3;
+                        if (blend >= 0.999f) uniqueIsPinned[i] = true;
+                    }
+                }
+            }
+            
+            // 3. Separate Free and Pinned
+            List<int> freeIndices = new List<int>();
+            List<int> pinnedIndices = new List<int>();
+            for (int i = 0; i < uniqueCount; i++)
+            {
+                if (uniqueIsPinned[i]) pinnedIndices.Add(uniqueOrigIndices[i]);
+                else freeIndices.Add(uniqueOrigIndices[i]);
+            }
+            
+            int numFree = freeIndices.Count;
+            int numPinned = pinnedIndices.Count;
+            int padFree = Mathf.CeilToInt(numFree / 256f) * 256;
+            if (padFree == 0 && numPinned > 0) padFree = 256; 
+            
+            state.FreeVertCount = numFree;
+            state.PadFreeCount = padFree;
+            int totalSim = padFree + numPinned;
+            state.VertCount = totalSim;
+            
+            state.VisualToSimMap = new int[originalVertCount];
+            int[] simToOrigMap = new int[totalSim];
+            int[] origToSimMap = new int[originalVertCount];
+            int currentSimIdx = 0;
+            
+            for(int i=0; i<numFree; i++) {
+                int orig = freeIndices[i];
+                origToSimMap[orig] = currentSimIdx;
+                simToOrigMap[currentSimIdx++] = orig;
+            }
+            
+            int dummyOrig = numFree > 0 ? freeIndices[0] : (numPinned > 0 ? pinnedIndices[0] : 0);
+            for(int i=numFree; i<padFree; i++) {
+                simToOrigMap[currentSimIdx++] = dummyOrig;
+            }
+            
+            for(int i=0; i<numPinned; i++) {
+                int orig = pinnedIndices[i];
+                origToSimMap[orig] = currentSimIdx;
+                simToOrigMap[currentSimIdx++] = orig;
+            }
+            
+            for (int i = 0; i < originalVertCount; i++) {
+                int rep = vertexMapping[i];
+                while (vertexMapping[rep] != rep) rep = vertexMapping[rep];
+                state.VisualToSimMap[i] = origToSimMap[rep];
+            }
+            
+            state.Position     = new Vector3[totalSim];
+            state.Velocity     = new Vector3[totalSim];
+            state.PredPosition = new Vector3[totalSim];
+            state.PrevPosition = new Vector3[totalSim];
+            state.IsPinned     = new bool[totalSim];
+            state.Mass         = new float[totalSim];
+            state.InvMass      = new float[totalSim];
+            state.VertexBoneWeights = new BoneWeight[totalSim];
+            state.SrcBindVerts = new Vector3[totalSim];
+            state.BindPoses    = bindPoses;
+            
+            float massPerFree = 1f / Mathf.Max(1, numFree);
+            for (int i = 0; i < totalSim; i++) {
+                int orig = simToOrigMap[i];
+                state.Position[i] = worldBaked[orig];
+                
+                bool isDummy = (i >= numFree && i < padFree);
+                bool isPinnedPart = (i >= padFree);
+                
+                state.IsPinned[i] = isPinnedPart;
+                if (isPinnedPart || isDummy) {
+                    state.Mass[i] = massPerFree;
+                    state.InvMass[i] = 0f;
+                } else {
+                    state.Mass[i] = massPerFree;
+                    state.InvMass[i] = 1f / massPerFree;
+                }
+                
+                if (srcBoneWeights != null && orig < srcBoneWeights.Length)
+                    state.VertexBoneWeights[i] = srcBoneWeights[orig];
+                if (srcVerts != null && orig < srcVerts.Length)
+                    state.SrcBindVerts[i] = srcVerts[orig];
+            }
+            
+            int[] newTris = new int[srcTris.Length];
+            for (int i = 0; i < srcTris.Length; i++) {
+                newTris[i] = state.VisualToSimMap[srcTris[i]];
+            }
+            
+            state.Tris = FilterValidTriangles(newTris, totalSim);
+            
             if (bindPoses != null && srcVerts != null && state.SkinBones != null && state.SkinBones.Length > 0)
             {
                 Matrix4x4[] skinMats = new Matrix4x4[state.SkinBones.Length];
@@ -1760,69 +1254,33 @@ namespace StudioModsMSG
                         : Matrix4x4.identity;
                 }
 
-                for (int i = 0; i < state.VertCount; i++)
+                for (int i = 0; i < totalSim; i++)
                 {
-                    int origIdx = newToOriginalMap[i];
-                    if (origIdx < 0 || origIdx >= srcVerts.Length) continue;
-                    Vector3 v = srcVerts[origIdx];
+                    Vector3 v = state.SrcBindVerts[i];
                     BoneWeight bw = state.VertexBoneWeights[i];
-
                     state.Position[i] =
                         (Vector3)skinMats[bw.boneIndex0].MultiplyPoint3x4(v) * bw.weight0 +
                         (Vector3)skinMats[bw.boneIndex1].MultiplyPoint3x4(v) * bw.weight1 +
                         (Vector3)skinMats[bw.boneIndex2].MultiplyPoint3x4(v) * bw.weight2 +
                         (Vector3)skinMats[bw.boneIndex3].MultiplyPoint3x4(v) * bw.weight3;
                 }
-                // worldRest may alias state.Position (welded path) — sync if separate
-                if (!ReferenceEquals(worldRest, state.Position))
-                    Array.Copy(state.Position, worldRest, state.VertCount);
             }
 
-            Vector3[] localRestFinal = new Vector3[state.VertCount];
-            for (int i = 0; i < state.VertCount; i++)
-                localRestFinal[i] = tf.InverseTransformPoint(worldRest[i]);
-            state.WorkMesh.vertices = localRestFinal;
-            state.WorkMesh.triangles = tris;
-            state.WorkMesh.uv = weldedUvs;
-            state.WorkMesh.RecalculateBounds();
-            state.WorkMesh.RecalculateNormals();
+            Array.Copy(state.Position, state.PrevPosition, totalSim);
+            Array.Copy(state.Position, state.PredPosition, totalSim);
 
-            // ── Rest Inflate: push vertices out along normals so cloth starts with volume ──
-            float inflate = state.Params.RestInflate;
-            if (inflate > 0.0001f)
-            {
-                Vector3[] meshNormals = state.WorkMesh.normals; // local-space normals (RecalculateNormals ran above)
-                for (int i = 0; i < state.VertCount; i++)
-                {
-                    Vector3 worldNormal  = tf.TransformDirection(meshNormals[i]);
-                    worldRest[i]        += worldNormal * inflate;
-                    state.Position[i]    = worldRest[i];
-                }
-                // Rebuild WorkMesh vertices from inflated positions so rest lengths are correct
-                for (int i = 0; i < state.VertCount; i++)
-                    localRestFinal[i] = tf.InverseTransformPoint(worldRest[i]);
-                state.WorkMesh.vertices = localRestFinal;
-                state.WorkMesh.RecalculateBounds();
-                state.WorkMesh.RecalculateNormals();
-            }
-
-            // Store rest positions in character-root local space (Compression + pinning).
             if (chaCtrl != null)
             {
-                state.RestBodyLocalPos = new Vector3[state.VertCount];
-                for (int i = 0; i < state.VertCount; i++)
-                    state.RestBodyLocalPos[i] = chaCtrl.transform.InverseTransformPoint(worldRest[i]);
+                state.RestBodyLocalPos = new Vector3[totalSim];
+                for (int i = 0; i < totalSim; i++)
+                    state.RestBodyLocalPos[i] = chaCtrl.transform.InverseTransformPoint(state.Position[i]);
             }
 
-            // Apply current selected-bone pinning.
-            RecomputePinsFromSelectedBone(state);
-
-            BuildEdges(state, tris, worldRest);
-            BuildBends(state, tris, worldRest);
-            // Mass and IsPinned are already set by RecomputePinsFromSelectedBone above.
+            BuildEdges(state, state.Tris, state.Position);
+            BuildBends(state, state.Tris, state.Position);
 
             GameObject go = smr.gameObject;
-            state.OriginalMaterials = smr.sharedMaterials;  // shared: no extra material instances
+            state.OriginalMaterials = smr.sharedMaterials;
             smr.enabled = false;
 
             if (state.Filter == null)  state.Filter  = go.AddComponent<MeshFilter>();
@@ -1834,18 +1292,13 @@ namespace StudioModsMSG
             state.MeshRend.sharedMaterials = state.OriginalMaterials;
             state.MeshRend.shadowCastingMode       = state.Renderer.shadowCastingMode;
             state.MeshRend.receiveShadows          = state.Renderer.receiveShadows;
-            state.MeshRend.lightProbeUsage         = state.Renderer.lightProbeUsage;
-            state.MeshRend.reflectionProbeUsage    = state.Renderer.reflectionProbeUsage;
-            state.MeshRend.probeAnchor             = state.Renderer.probeAnchor;
-            state.MeshRend.allowOcclusionWhenDynamic = state.Renderer.allowOcclusionWhenDynamic;
 
             state.ClothCollider.convex = false;
             state.ClothCollider.sharedMesh = null;
             state.ClothCollider.sharedMesh = state.WorkMesh;
             state.ClothCollider.enabled = true;
 
-            state.LocalVerts = new Vector3[state.VertCount];
-            // Initial pin positions will be set by SkinPinnedVertices on next frame
+            state.LocalVerts = new Vector3[originalVertCount];
             UpdateWorldBounds(state);
             return true;
         }

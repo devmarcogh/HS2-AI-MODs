@@ -149,20 +149,7 @@ namespace StudioModsMSG
         [DllImport(DLL, CallingConvention = CallingConvention.Cdecl)]
         public static extern void SHash_Destroy(long handle);
 
-        // ── Batch Skinning ──────────────────────────────────────
-
-        [DllImport(DLL, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void Skin_ForwardBatch(
-            [In] Vec3Native[] bindVertices,
-            [In] BoneWeightNative[] boneWeights,
-            [In] Mat4x4Native[] skinMatrices,
-            [In] int[] sbVertexIndices,
-            int sbCount,
-            [Out] float[] outWorldPos
-        );
-
         // ── Managed helpers for Vector3[] <-> float[] ───────────
-
         public static float[] Vec3ArrayToFlat(Vector3[] src, int count)
         {
             float[] flat = new float[count * 3];
@@ -307,7 +294,8 @@ namespace StudioModsMSG
             int resX, int resY, int resZ,
             float originX, float originY, float originZ,
             float invCellSize, float maxDist,
-            float thickness);
+            float thickness,
+            float gradientFactor);
 
         // ── Managed helpers for bool[] -> int[] ─────────────────
 

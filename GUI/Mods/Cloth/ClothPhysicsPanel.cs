@@ -15,7 +15,6 @@ namespace StudioModsMSG
             public float BendStiffness;
             public float Damping;
             public float Thickness;
-            public float RestInflate;
             public float Gravity;
             public float Weight;
             public float Compression;
@@ -199,7 +198,6 @@ namespace StudioModsMSG
                 BendStiffness = p.BendStiffness,
                 Damping = p.Damping,
                 Thickness = p.Thickness,
-                RestInflate = p.RestInflate,
                 Gravity = p.Gravity,
                 Weight = p.Weight,
                 Compression = p.Compression,
@@ -224,7 +222,6 @@ namespace StudioModsMSG
             p.BendStiffness = snap.BendStiffness;
             p.Damping = snap.Damping;
             p.Thickness = snap.Thickness;
-            p.RestInflate = snap.RestInflate;
             p.Gravity = snap.Gravity;
             p.Weight = snap.Weight;
             p.Compression = snap.Compression;
@@ -409,10 +406,11 @@ namespace StudioModsMSG
                     selectedMesh.SimulationMode = ClothSimulationMode.Continuous;
 
                 GUILayout.Space(2f);
-
+                /*
                 if (GUILayout.Button("Manual Deformation", isManual ? onStyle : offStyle,
                         GUILayout.Height(26f), GUILayout.ExpandWidth(true)))
                     selectedMesh.SimulationMode = ClothSimulationMode.ManualDeformation;
+                    */
             }
             GUILayout.EndHorizontal();
 
@@ -453,7 +451,6 @@ namespace StudioModsMSG
             DrawFloatRow(host, "Bending",     ref p.BendStiffness,    0f,       50f);
             DrawFloatRow(host, "Damping",     ref p.Damping,          0.5f,     20f);
             DrawFloatRow(host, "Thickness",   ref p.Thickness,        0.001f,   0.2f);
-            DrawFloatRow(host, "Rest Inflate", ref p.RestInflate,     0f,       0.04f);
             DrawFloatRow(host, "Gravity",     ref p.Gravity,         -30f,      0f);
             DrawFloatRow(host, "Weight",      ref p.Weight,           0.1f,     3f);
             DrawFloatRow(host, "Compression", ref p.Compression,      0f,       1f);
@@ -492,9 +489,6 @@ namespace StudioModsMSG
             GUILayout.Space(4f);
             if (GUILayout.Button("Apply Pins", GUILayout.Height(22f), GUILayout.Width(88f)))
                 logic.RecomputePins(lastSelection, selectedMesh);
-            GUILayout.Space(4f);
-            selectedMesh.ShowPinBoneGizmos = GUILayout.Toggle(
-                selectedMesh.ShowPinBoneGizmos, "Gizmos", GUILayout.Width(56f));
             GUILayout.EndHorizontal();
 
             int pinned = 0;

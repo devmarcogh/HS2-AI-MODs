@@ -9,17 +9,10 @@ namespace StudioModsMSG
     // -----------------------------------------------------------------------
     enum ClothSimulationMode
     {
-        /// <summary>Always simulating every frame.</summary>
-        Continuous        = 0,
-        /// <summary>
-        /// Cloth is frozen until the user holds the ManualDeform keybinding and
-        /// right-click-drags near the mesh.  While the binding is held, vertices
-        /// within DeformRadius of the cursor are awakened and pulled toward the
-        /// cursor position, creating physics-based cloth sculpting.  On key
-        /// release the simulation pauses automatically.
-        /// </summary>
-        ManualDeformation = 1,
+        Continuous,
+        ManualDeformation
     }
+
 
     // -----------------------------------------------------------------------
     // Per-cloth-mesh physics parameters (mutable at runtime via GUI sliders)
@@ -33,7 +26,6 @@ namespace StudioModsMSG
         public float BendStiffness    = 4f;     // moderate fold resistance
         public float Damping          = 8f;     // high damping → settles quickly, no oscillation at rest
         public float Thickness        = 0.012f; // thin collision offset (metres)
-        public float RestInflate      = 0.006f; // minimal inflate to prevent z-fighting
         public float Gravity          = -9.81f; // Y gravity (game units/s²; HS2 ≈ 1 unit = 1 m)
         public float Weight           = 0.55f;  // light cloth — underwear is thin fabric
         // Quality presets: 0.25 / 0.5 / 0.75 / 1.0 / 2.0 / 4.0 / 6.0 / 8.0
@@ -48,6 +40,7 @@ namespace StudioModsMSG
         public float Compression      = 0f;
         public float Elasticity       = 0.05f;  // legacy/reserved; StretchStiffness is primary control
         public bool  NeedsTangents    = true;    // RecalculateTangents per frame (needed for normal-mapped materials)
+        public float DecimationThreshold = 0.0001f; // Threshold for welding/decimation (metres)
 
     }
 
@@ -65,26 +58,13 @@ namespace StudioModsMSG
         // -- Toggle & per-mesh simulation control --
         public bool IsActive          = false;
         public bool SimulationPaused  = false;  // independent pause/play per mesh
-
-        // -- Simulation mode --
         public ClothSimulationMode SimulationMode = ClothSimulationMode.Continuous;
-        /// <summary>
-        /// World-space radius around the cursor used in ManualDeformation mode:
-        /// vertices within this radius are awakened and attracted toward the cursor.
-        /// </summary>
-        public float  DeformRadius = 0.12f;
-        /// <summary>Frames a vertex stays awake after the last manual-deform interaction.</summary>
-        public const int TriggerCooldownFrames = 60;
-        /// <summary>Per-vertex countdown; 0 = frozen, > 0 = simulating (allocated on activation).</summary>
-        public int[]  TriggerCooldown;
 
-        // -- Manual-deformation drag state (set each frame by ClothSoftBodyRuntime) --
-        /// <summary>Closest mesh vertex to the cursor, or -1 when not dragging.</summary>
-        public int     DragVertexIndex   = -1;
-        /// <summary>World-space target position the dragged vertex is attracted toward.</summary>
-        public Vector3 DragTargetWorld   = Vector3.zero;
-        /// <summary>True while the user is actively holding the keybind and right-click dragging.</summary>
-        public bool    IsDragging        = false;
+        // -- Manual deformation (GUI-driven sculpting) --
+        public float    DeformRadius     = 0.15f;
+        public float[]  TriggerCooldown; // per-vertex cooldown for manual deform
+        public bool     IsDragging       = false;
+
 
         // -- Per-mesh LBS cache (fixes cross-mesh bone-follow corruption) --
         // Must NOT be shared across states; each state owns its own buffer.
@@ -96,7 +76,11 @@ namespace StudioModsMSG
         public const int WarmupDuration = 12;
 
         // -- Topology (built once on activation, remains frozen) --
-        public int     VertCount;
+        public int     OriginalVertCount; // count in the visual mesh (with duplicate vertices at seams)
+        public int     VertCount;         // total count in the simulation (Free + Dummies + Pinned)
+        public int     FreeVertCount;     // actual number of free particles
+        public int     PadFreeCount;      // free count padded to multiple of 256 (for GPU dispatch)
+        public int[]   VisualToSimMap;    // maps original visual vertex index to simulation particle index
         public int[]   Tris;            // flat [a,b,c, a,b,c, ...] triangle list
         public int[]   Edges;           // flat [i,j, i,j, ...] deduplicated edges
         public float[] RestEdgeLen;     // rest length for each edge pair
